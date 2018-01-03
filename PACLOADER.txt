@@ -1,0 +1,1373 @@
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+
+
+ALTER                PROCEDURE dbo.psp_TransformClassicPACData 
+@BypassPACHold char(1)
+AS
+
+/*  
+	Modified 12/27/05 BAR - Add email to Accounting when a new multi-page
+							(i.e. variable page count) print group is found
+							for a given CID.
+    Modified 10/29/05 BAR - Revoke 07/19 mod to call to refresh postage and 
+							service	balances. This is now done as the first
+							step in the daily report distribution sweep at
+							1:30 pm.
+    Modified 10/26/05 BAR - Add refresh of ReportCR517 table
+	Modified 10/15/05 BAR - Use OriginalCID instead of CID in PACLOADER
+							when assigning TSP_IDs
+    Modified 09/30/05 BAR - Add ResultCode column.
+	Modified 09/28/05 BAR - Move the phantom print group logic to here
+						    from psp_TransformClassicPacData2. This was done
+							so the modifications to PACLOADER records would
+							be done before loading them to WorkMOAT.
+    Modified 08/26/05 BAR - Eliminate CIDs containing "?
+	Modified 07/25/05 BAR - Add conditional database code for 7/19 mods.
+    Modified 07/19/05 BAR - Add call to refresh postage and service balances    
+    Modified 07/01/05 BAR - Add conditional database code for testing.
+    Modified 06/30/05 BAR - Move execution of psp_RefreshMultiplePricingBasePrices
+						    to psp_TransformClassicPACData2
+						  - Move appending of print group to letter number from here
+					 		to psp_TransformClassicPACData2
+    Modified 06/13/05 BAR - Eliminate records with special characters in CID
+	Modified 06/07/05 BAR - Eliminate records with null CIDs
+	Modified 04/19/05 BAR - Add execute of psp_RefreshDailyCountTable.
+    Modified 04/18/05 BAR - Move execute of
+							psp_AuditProportionOfNonPrintedLetters to
+							just after it is determined that PACMASTER
+							is empty and that brand-new data is to
+							be load from FROMPACWORK.dbo.PACMASTERPOOL
+	Modified 04/11/05 BAR - Get all master information from PIPPIN\PROD,
+							even if running in test mode on ARAGORN\DEV.
+							This ensures that we don't have spurious
+							discrepancies because of out-dated synching
+							of ARAGORN\DEV.Control from PIPPIN\PROD.Control.
+	Modified 04/05/05 BAR - Check for new Type field values
+	Modified 03/22/05 BAR - Add new fields HF (Header flag) and DN(Detail Number).
+						    Required to fix ARMS pricing - there was not other way
+						    for us to distinguish ARMS trailer headers and trailer details
+							when the Type changed to 'NoPr'.
+	Modified 02/14/05 BAR - Add refresh of [PIPPIN\PROD].Control.dbo.MultiplePagePricing
+							using psp_RefreshMultiplePricingBasePrices
+	Modified 01/27/05 BAR - Enhance the logic that reassigns billing CID
+						   to use the offset and length values in
+						   ReassignBillingClient. This was done to
+						   allow us to use a substring of the data
+						   field to test against the argument. This
+						   allowed us to avoid having to keep
+						   ReassignBillingClient updated with each
+						   new 3xx letter for CBH > CBM.
+   Modified 01/13/05 BAR - If this is a regular run, report any
+						   clients/batches for which the treshold
+						   count for non-printed letters has been
+						   exceeded.
+   Modified 01/07/05 BAR - Get list of batches loaded today from
+						   FROMPACWORK.dbo.PACMASTERPOOL before the
+						   load, instead of from LOADLOG after the
+						   load. Fixes problem of double counting
+						   on-hold items.
+						 - Send list of batches and counts, distinguished
+						   by Simplex/Duplex to Production
+   Modified 12/15/04 BAR - Include Sys in the LoadLog entries
+						   for batches loaded for each SDT.
+   Modified 12/14/04 BAR - Send list of batches loaded today to Processing
+					  	   for confirmation. This is to catch the
+						   problem of the PAC system failing to create
+						   the MOAT load data files.
+   Modified 10/19/04 BAR - Point to ARAGORN\TEST is not running production
+-- Modified 10/18/04 BAR - If PACx reassigned the print group for a letter
+--					and the reassignment rules are specified in
+--					[PIPPIN\PROD].Control.dbo.PrintGroupSwitch,
+--				    then rename the letter by appending '-XXXX' to it,
+--					where XXXX = the new print group.
+--					This allows us to properly determine the component
+--				 	set for a letter, even if the print group changes
+--					during processing.
+   Modified 10/12/04 BAR - Move execution of psp_TransformVxxFields
+						   to dbo.psp_TransformClassicPACDataLoadMOAT.
+						   This was done so that WORKMOAT.M_TheirClient
+						   can be populated from MOATVars before it
+						   is posted to MOAT.
+   Modified 08/20/04 BAR - Send "duplicate CID/SDT/RID/BAT found"
+						   message to MOAD_Dups instead of MOAD-Admin.
+   Modified 07/22/04 BAR - Get rid of code commented out for the
+						   move to component-based pricing
+					     - Fix problem with emails not being sent out
+						   when null letter pricing information is found.
+						   The problem was that the query was using tables
+						   on PIPPIN\PROD, but sendmail couldn't do the
+						   operation because of cross-server security.
+						   Solution was to pull PIPPIN\PROD data into
+						   NullLetterPricingLog on GANDALF\MOAD and to
+						   query that table in the sendmail function.
+						 - Re-instate the test for NULL TSP_HasReturnEnvelope.
+						   While not required for component-based pricing,
+						   it is need for line item text on the invoice.
+   Modified 07/17/04 BAR - Exclude any CID containing an underscore character
+   Modified 07/16/04 BAR - Fixed problem introduced by removal of
+						   processing and billing CID values from
+						   PROD.Control.ReAssignBillingClient table
+   Modified 07/14/04 BAR - Comment out code that eliminated from the
+						   zero-priced letter report those letters where
+						   TSP_PriceNote = '*', since these are now
+						   specified in TransPriceOverride table
+						 - Eliminate ZZZ client from the
+						   zero-priced letter report
+   Modified 07/09/04 BAR - Reinstate billing client logic, but now
+						   it is being done to PACLOADER
+   Modified 07/08/04 BAR - Comment out assignment of billing client
+						   logic.
+   Modified 07/06/04 BAR - Comment out
+						   references to VRMED and VRTR, per PAC change in
+						   "Edit VAO Acctg CID" on 1/27/04.
+   Modified 06/16/04 BAR - Adjust postage pricing for CSQ letters which
+						   have variable page counts.
+   Modified 06/15/04 BAR - Commented out. Now done in PIPPIN\PROD.Control.psp_RollupLetterPricesFromComponents
+   Modified 06-14-04 BAR - Eliminate pricing rollups. Moved
+						   to psp_RollupLetterPricingFromComponents
+						   in PIPPIN\PROD.Control (called by
+						   psp_SynchSIXPACtoPACx)
+					       Also, comment out the code that 
+						   checks for the existence of Client_Component
+						   rows for all TransSpec_Component rows.
+   Modified 05-13-04 BAR - Add CL_ContractBasePrice to TSP_Price. This is required
+						   so Michelle can set the component prices to their
+						   incremental price over the base price, instead of
+						   breaking up the base package price into components.
+						   This means that we are forgoing the ability to
+						   analyze margins for individual components. We will
+						   be able to analyze margins only from the letter-level up.
+   Modified 03-09-04 BAR - Sequester records with duplicate CID/SDT/RID/BAT for
+						   analysis. We are now allowing duplicate RIDs if
+						   they appear in different batches.
+   Modified 02/23/04 BAR - Major change from print-group-based pricing to
+						   component-based pricing. Eliminate all references
+						   to PrintGroup.
+   Modified 12-02-03 BAR - Truncation of FROMPACWORK.dbo.PACMASTERPOOL moved 
+							from the end of this procedure to immediately after
+							loading to PACMASTER to eliminate possibility of 
+							losing data if this	procedure is run in restart 
+							mode, i.e. PACMASTER still holds data.
+   Modified 12-02-03  - BAR Modified the logic that identifies orphaned
+						    trailer detail records and tries to fix them. The
+							logic is flawed because it cannot account for those
+							cases where the original set count is no longer valid
+						    because the maximum trailer set count has been set to
+						    a lower value than the set count. This results in
+							multiple sub-sets of trailer headers and details
+							within the original set. 
+							The logic is further flawed because it has to presume 
+							that each trailer set starts with a row with Type = TrHd, 
+							but this is not necessarily	so - the Type could have 
+							changed to NoFwd or something else, thwarting any attempt 
+							to identify it as a trailer header.
+							Result: We identify problems, but we don't halt processing.
+   Modified 11-21-03  - BAR Fixed problem that caused spurious error
+					        in identifying unresolveable orphaned trailers.
+							Needed to include SC <> 1 in the join to get
+						    only items with SC > 1.
+   Modified 11-04-03  - BAR Add SPA invoicing start date to email about
+						    stuff on pricing hold.
+   Modified 10-31-03  - BAR If RID preceding the first orphaned trailer RID is
+						for the same Client and has the same SC and has PRT IS NULL
+						then set the Prt on the orphaned trailers to NULL.
+   Modified 10-31-03  - BAR Add SDT, BAT, Sys and RID to the orphaned trailer email.
+   Modified 10-29-03  - BAR Revert to executing local versions of dbo.psp_EmailSend and
+						psp_EmailSendWithQuery. Necessary because we want to stick
+						with the new security constraints in SQL 2000 SP3a, which
+					    don't allow an external stored procedure (in this case xp_sendmail)
+					    to be called remotely. Formerly, we did all SQL emailing from
+					    PIPPIN\PROD for efficiency, but that is no longer possible.
+   Modified 09-12-03  - BAR Added logic to ensure that all values in Client_PrintGroup
+						and TransSpec that are supposed to be inherited from PrintGroup
+						and Client_PrintGroup respectively, actually are.
+   Modified 09-02-03  - BAR Added logic to handle orphaned trailer detail records.
+					    This is necessary because sometimes PAC sends trailer
+					    detail without accompanying trailer headers. Usually
+					    the trailer detail records are really trailer header
+						records whose Type was set incorrectly. If so, we
+						change Type from "Tr" or "TrDt" or "Trlr" to "TrHd".
+					    However, if the Set Count is not 1, all bets are off
+						so we sound the alarm.
+   Modified 08-14-03  - BAR Only assign CL_ID_Original if its value
+						is NULL. This prevents it from being overwritten
+						by another load which processes data with
+						the same processing date. This affected
+						VAO, whose data is distributed to several
+						VANRU billing clients by this SP.
+   Modified 08-08-03  - BAR Use TransSpec on PIPPIN\PROD instead
+					    of on MOAD to ensure data is fresh.
+   Modified 07/25/03  - BAR Add logic to change the print group
+					    to Jxxx where it's Qxxx or Zxxx. We don't
+						need the Qxxx or Zxxx in SIXPAC.
+   Modified 04/28/03  - BAR Add logic to bypass the load steps
+						when no data remains in PACLOADER for the tendered day.
+   Modified 03/31/03  - BAR Set print group pricing overrides in SIXPAC where required. This
+					    ensures that the letter-level overrides are accurate before
+					    wea start pricing production data.
+   Modified 03/10/03  - BAR Add logic to use only DISTINCT rows from
+					    PACHOLD since it is possible that a restart
+						after a failed load could post duplicate rows
+					    to PACHOLD.
+   Created 01/31/2002 - BAR
+   Description: Loads MOAT, MOATVARS and MOAT_Component from PACLOADER 
+                into the SQL Server GANDALF\MOAD\MOAT table.
+		This procedure is run nightly as a SQL Server 
+                scheduled task on the MOAD database.
+	 	Here are the steps:
+		- load the contents of PACHold into PACLOADER for
+	   	  re-evaluation
+		- verify that all records in PACHold get loaded into
+		  PACLOADER. If so, delete rows in PACHold. If not,
+		  send an email and terminate the procedure.
+		- 
+   Input Parms: None
+   Output Parms:None
+   Emails:
+	- If the PACLOADER rowcount after the load from PACHold is 
+	  not equal to the sum of the rows of the PACHold and the
+	  preload-time PACLOADER, sends an email and returns.
+	- If clients are found in PACLOADER who are not registered
+	  yet in the SIXPAC.Client table, send an email listing the
+	  CIDs to be added before accounting reports can be run.
+	- If print groups are found in PACLOADER which are not registered
+	  yet in the SIXPAC.PrintGroup table, send an email listing the
+	  Print Groups to be added before accounting reports can be run.
+	- If letters are found in PACLOADER which are not registered
+	  yet in SIXPAC, send an email listing the
+	  letters to be added before accounting reports can be run.
+*/
+
+
+
+DECLARE @EmailStat int
+DECLARE @Subjectx varchar(100)
+DECLARE @Messagex varchar(1000)
+DECLARE @Recipientsx varchar(100)
+DECLARE @QueryString nvarchar(1000)
+DECLARE @AttachResults varchar(5)
+
+DECLARE @NextBatch varchar(2)
+DECLARE @EarliestDate smalldatetime
+DECLARE @StartTime datetime
+DECLARE @StartItemTime datetime
+DECLARE @EndItemTime datetime
+DECLARE @ElapsedSeconds int
+DECLARE @ReturnStatus int
+DECLARE @PgmName varchar(100)
+DECLARE @ControlServerName varchar(50)
+SET @EarliestDate = '01-01-90' 
+SET @NextBatch = ''
+SET @Subjectx = CASE @@ServerName WHEN 'GANDALF\MOAD' THEN '' ELSE '*** TEST ONLY ***' END + ' MOAD Load error'
+SET @Recipientsx = 'MOAD-Admin'
+SET @PgmName = 'psp_TransformClassicPACData'
+SET @AttachResults = 'False'
+IF @@ServerName = 'GANDALF\MOAD'
+	SET @ControlServerName = 'PIPPIN\PROD'
+IF @@SERVERNAME = 'ARAGORN\DEV'
+	SET @ControlServerName = 'ARAGORN\TEST'
+
+SET NOCOUNT ON
+-- Was the last load attempt successful? If not, send an email and exit.
+-- Otherwise, continue.
+IF (SELECT COUNT(LL_Flag) FROM LoadLog WHERE LL_FLAG = 'N') > 0
+  BEGIN
+      SET @Messagex = 'Last load attempt had a problem. Please fix and reset LL_FLAG to Y'
+      EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+      GOTO BAD_EOJ
+  END
+
+
+-- Start time for this load
+	SET @StartTime = GETDATE()
+
+
+-- Drop PACLOADER indexes (if they exist) to speed loading
+-- EXECUTE dbo.psp_DropPACLOADERIndexes
+
+	INSERT LoadLog
+
+	SELECT GETDATE(), '', 0,@EarliestDate, '', 50
+
+	INSERT LoadLog
+	SELECT GETDATE(), '', 0,@EarliestDate, '', 53
+
+DECLARE @VariableCount int
+DECLARE @CurrentVariable int
+DECLARE @PACLOADERTargetCount int
+DECLARE @WorkInt int
+DECLARE @ExecString nvarchar(4000)
+DECLARE @VarName varchar(4)
+DECLARE @PACVarName varchar(4)
+DECLARE @CountTest int
+DECLARE @CountTest2 int
+DECLARE @CountTest3 int
+DECLARE @CountTest4 int
+DECLARE @CountTest5 int
+DECLARE @TestRowCount int
+DECLARE @TestRowCount2 int
+DECLARE @ErrCode int
+DECLARE @Counter int
+
+DECLARE @TableVarCount table (Counter int)
+DECLARE @EndTime datetime
+DECLARE @BadCounts1 char(1)
+DECLARE @BadCounts2 char(1)
+DECLARE @ArgumentField varchar(50)
+DECLARE @SQLString varchar(2000)
+DECLARE @Offset char(2)
+DECLARE @Length char(2)
+
+
+/*************************************************************************
+
+NOTE: @VariableCount must change if PAC adds variables beyond V097
+************************************************************************
+*/
+SET @VariableCount = 97
+
+
+-- 02/23/04 BAR Verify that all required fields in TransSpec are non-null
+TRUNCATE TABLE NullLetterPriceLog
+
+
+
+  IF @@SERVERNAME = 'GANDALF\MOAD'
+	INSERT NullLetterPriceLog
+	SELECT DISTINCT CL_CID AS CID, TSP_Name AS Ltr, TSP_Price AS Price, TSP_Type AS Type, TSP_DomesticPostageRate AS USPostage, TSP_MexCanPostageRate AS MexCanPostage, TSP_OffContPostageRate AS IntPostage, TSP_PostageRevenue as PRevenue
+	FROM [PIPPIN\PROD].Control.dbo.TransSpec T
+	JOIN [PIPPIN\PROD].Control.dbo.Client CL
+	ON (T.CL_ID = CL.CL_ID AND
+		(TSP_Price IS NULL OR
+		TSP_Type IS NULL OR
+	    TSP_DomesticPostageRate IS NULL OR
+		TSP_MexCanPostageRate IS NULL OR
+		TSP_OffContPostageRate IS NULL OR
+		TSP_PostageRevenue IS NULL))
+
+  IF @@SERVERNAME = 'ARAGORN\DEV'
+	INSERT NullLetterPriceLog
+	SELECT DISTINCT CL_CID AS CID, TSP_Name AS Ltr, TSP_Price AS Price, TSP_Type AS Type, TSP_DomesticPostageRate AS USPostage, TSP_MexCanPostageRate AS MexCanPostage, TSP_OffContPostageRate AS IntPostage, TSP_PostageRevenue as PRevenue
+	FROM [ARAGORN\TEST].Control.dbo.TransSpec T
+	JOIN [ARAGORN\TEST].Control.dbo.Client CL
+	ON (T.CL_ID = CL.CL_ID AND
+		(TSP_Price IS NULL OR
+		TSP_Type IS NULL OR
+	    TSP_DomesticPostageRate IS NULL OR
+		TSP_MexCanPostageRate IS NULL OR
+		TSP_OffContPostageRate IS NULL OR
+		TSP_PostageRevenue IS NULL))
+
+IF @@RowCount > 0 
+  BEGIN
+	SET @ExecString = 'SELECT * FROM [' + @@SERVERNAME + '].MOAD.dbo.NullLetterPriceLog'
+	SET @Messagex = 'NULL pricing values found for letters in the TransSpec table. 
+					 Please fix and restart psp_TransformClassicPACData.'
+	SET @Subjectx = 'Letters with null values in Price, Type, Domestic Postage Rate,
+					 Mexico/Canada postage rate, off-continent postage rate or
+					 postage revenue rate:'
+	SET @Recipientsx = 'MOAD-Admin'
+	SET @AttachResults = 'True'
+	EXEC @EmailStat = dbo.psp_EmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+		GOTO BAD_EOJ	 
+ END
+
+
+
+INSERT LoadLog
+SELECT GETDATE(), '', 0,@EarliestDate, '', 116
+
+-- Get new data from PACMASTERPOOL if this is not a restart
+IF (SELECT COUNT(CID) FROM PACMASTER) = 0
+BEGIN
+
+IF @BypassPACHold = 'N'
+BEGIN
+-- Send to Processing for confirmation the email list of batches to be loaded 
+	EXEC psp_ReportListOfAllBatchesLoadedToday
+
+-- Send to Production for information the email list of batches to be loaded 
+	EXEC psp_ReportListOfAllBatchesLoadedToday_Production
+
+-- Send email if non-printed records exceed threshold
+	EXEC dbo.psp_AuditProportionOfNonPrintedLetters
+END
+
+
+	INSERT PACMASTER
+	SELECT DISTINCT * FROM FROMPACWORK.DBO.PACMASTERPOOL
+	
+		SELECT @ErrCode = @@ERROR, @CountTest = @@ROWCOUNT
+		IF @ErrCode <> 0 
+		  BEGIN
+	           SET @Messagex = 'Attempt to load PACMASTER from PACMASTERPOOL failed. Possible structure mismatch. Error Code: ' + STR(@ErrCode)
+	           EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+		   GOTO BAD_EOJ
+		  END
+
+-- 12-02-03 BAR - Truncation moved here from the end of this procedure
+--				  to eliminate possibility of losing data if this
+--				  procedure is run in restart mode, i.e. PACMASTER
+--				  has data.
+	TRUNCATE TABLE FROMPACWORK.DBO.PACMASTERPOOL
+	
+END
+
+	INSERT LoadLog
+	SELECT GETDATE(), '', 0,@EarliestDate, '', 118
+
+
+/* Get rowcount from PACHold 
+
+If it's more than 0, that means that we are holding some PAC records from
+a previous run because SIXPAC didn't have a Client, Letter, PrintGroup
+or PricingGroup occuring in the PAC data. These records will have to be
+added back into PACLOADER to be re-evaluated.
+ */
+
+IF @BypassPACHold = 'Y'
+	GOTO AfterPACHoldLoad
+
+TRUNCATE TABLE WORKPACHOLD
+
+-- Get the count of unique rows in PACHOLD
+INSERT WORKPACHOLD
+SELECT DISTINCT *
+FROM PACHOLD
+
+SELECT @ErrCode = @@ERROR, @PACLOADERTargetCount = @@ROWCOUNT
+SET @CountTest = @PACLOADERTargetCount
+
+INSERT LoadLog
+SELECT GETDATE(),'', @CountTest,'','',1
+/* PRINT @PACLOADERTargetCount */
+/* Add rowcount from PACLOADER 
+*/
+
+
+/* Load the rows from PACHold back into PACMASTER for re-evaluation 
+*/
+-- Are there any rows in PACHOLD?
+IF @CountTest > 0
+BEGIN
+	INSERT PACMASTER
+	([CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], [ARMSFlag], [APrt], [HF], [DN], [ResultCode])
+	SELECT DISTINCT [CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], [ARMSFlag], [APrt], [HF], [DN], [ResultCode]
+    FROM PACHold
+
+	SELECT @ErrCode = @@ERROR, @CountTest = @@ROWCOUNT
+	IF @ErrCode <> 0 
+	  BEGIN
+           SET @Messagex = 'Attempt to load PACMASTER from PACHold failed. Possible structure mismatch. Error Code: ' + STR(@ErrCode)
+           EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	   GOTO BAD_EOJ
+	  END
+
+	INSERT LoadLog
+	SELECT GETDATE(),'', @CountTest,@EarliestDate,'', 5
+/*	PRINT 'Records copied from PACHold to PACLOADER'
+*/
+END
+-- Did PACHold records load OK to PACMASTER?
+
+IF @PACLOADERTargetCount <> @CountTest
+  BEGIN
+    SET @Messagex = 'Attempt to load PACMASTER from PACHold failed. Possible structure mismatch. @PACLOADERTargetCount=' + LTRIM(STR(@PACLOADERTargetCount)) + '  @CountTest=' + LTRIM(STR(@CountTest))
+    EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+
+    GOTO BAD_EOJ
+  END
+ELSE
+  IF @CountTest >0 
+    TRUNCATE TABLE PACHold
+
+AfterPACHoldLoad:
+
+-- 12/27/05 BAR - Add email to Accounting when a new multi-page
+--				  (i.e. variable page count) print group is found
+--				  for a given CID.
+EXEC dbo.psp_MOAT_NewMultiPagePrintGroupAndCIDCombo
+
+
+-- ***** Refresh [PIPPIN\PROD].Control.dbo.MultiplePagePricing ***********
+-- 06/30/05 BAR - Moved to psp_TransformClassicPACData2
+-- EXEC @ReturnStatus = [PIPPIN\PROD].COntrol.dbo.psp_RefreshMultiplePricingBasePrices
+-- IF @ReturnStatus = 0
+-- 	GOTO BAD_EOJ
+-- 	
+-- INSERT LoadLog
+-- 	SELECT GETDATE(),'', 0, @EarliestDate, '', 123
+
+-------------------------------------------------------------------
+-- Loop to serially process each batch in PACMASTER
+-------------------------------------------------------------------
+WHILE (SELECT COUNT(CID) FROM PACMASTER) > 0
+BEGIN
+
+	TRUNCATE TABLE WorkCount
+	TRUNCATE TABLE MissingLog
+	TRUNCATE TABLE PACLOADER
+
+
+
+-- Load the next day from PACMASTER into PACLOADER
+-- 1. Identify the next day to process
+	SET @EarliestDate = (SELECT MIN(SDT) FROM PACMASTER)
+--	SELECT @NextBatch = (SELECT TOP 1 BAT FROM PACMASTER WHERE SDT = @EarliestDate ORDER BY BAT)
+
+-- 2. Get record count for the batch to be processed now
+	SET @CountTest3 = (SELECT COUNT(CID) FROM PACMASTER WHERE SDT = @EarliestDate)
+
+	SELECT @ErrCode = @@ERROR, @CountTest = @@ROWCOUNT
+	SET @PACLOADERTargetCount = @PACLOADERTargetCount + @CountTest
+
+	
+	INSERT LoadLog
+	SELECT GETDATE(), '', 0, @EarliestDate, '', 45
+	
+	INSERT LoadLog
+	SELECT GETDATE(),'', (@PACLOADERTargetCount - @CountTest), @EarliestDate, '',2
+/* PRINT @PACLOADERTargetCount */
+
+-- Load batch to PACLOADER. 
+	INSERT PACLOADER([CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], [ARMSFlag], [APrt], [HF], [DN], [ResultCode])
+	SELECT DISTINCT [CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], [ARMSFlag], [APrt], [HF], [DN], [ResultCode]
+    FROM PACMASTER 
+	WHERE SDT = @EarliestDate
+
+	SELECT @ErrCode = @@ERROR, @CountTest2 = @@ROWCOUNT
+
+	IF @ErrCode <> 0 
+	    BEGIN
+	     SET @Messagex = 'Attempt to load PACLOADER from PACMASTER failed. Expected adds:' + @CountTest + ' Actual:' + @CountTest2 + '. Possible structure mismatch. Error Code: ' + STR(@ErrCode)
+             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     GOTO BAD_EOJ
+	    END
+	INSERT LoadLog
+	SELECT GETDATE(),'', @CountTest2, @EarliestDate, '', 42
+
+-- 07/09/04 BAR - Re-assign billing clients where appropriate
+
+-- First, set the OriginalCID value
+   UPDATE PACLOADER
+   SET OriginalCID = CID
+
+-- Is there any data with potential for billing CID re-assignment?
+ IF @@ServerName = 'GANDALF\MOAD'
+   SET @CountTest5 = (SELECT COUNT(CID)
+					   FROM PACLOADER P
+					   JOIN [PIPPIN\PROD].Control.dbo.Client CL
+					   ON (CL.CL_CID = P.CID)
+					   JOIN [PIPPIN\PROD].Control.dbo.ReAssignBillingClient RBC
+					   ON (RBC.RBC_ProcessingCID = CL.CL_ID))
+
+ IF @@ServerName = 'ARAGORN\DEV'
+   SET @CountTest5 = (SELECT COUNT(CID)
+					   FROM PACLOADER P
+					   JOIN [ARAGORN\TEST].Control.dbo.Client CL
+					   ON (CL.CL_CID = P.CID)
+					   JOIN [ARAGORN\TEST].Control.dbo.ReAssignBillingClient RBC
+					   ON (RBC.RBC_ProcessingCID = CL.CL_ID))
+
+   IF @CountTest5 > 0
+	BEGIN
+-- Identify the list of argument columns that will be used to qualify
+-- records for re-assignment of billing CIDs.
+-- Use a cursor to iterate through this list and build and execute the update
+-- queries.
+--	 IF @@ServerName = 'GANDALF\MOAD'
+		DECLARE RBC CURSOR FOR 
+		SELECT DISTINCT RBC_ArgumentField, RBC_Offset, RBC_Length
+		FROM [PIPPIN\PROD].Control.dbo.ReAssignBillingClient
+
+-- 	 ELSE
+-- 		DECLARE RBC CURSOR FOR 
+-- 		SELECT DISTINCT RBC_ArgumentField, RBC_Offset, RBC_Length
+-- 		FROM [ARAGORN\TEST].Control.dbo.ReAssignBillingClient
+		
+		OPEN RBC
+		
+		FETCH NEXT FROM RBC 
+		INTO @ArgumentField, @Offset, @Length
+		
+		WHILE @@FETCH_STATUS = 0
+			BEGIN
+			   SET @SQLString = 'UPDATE P ' +
+								'SET CID = (SELECT CL_CID FROM [' + @ControlServerName +
+											'].Control.dbo.Client C ' +
+											'WHERE C.CL_ID = RBC.RBC_BillingCID) ' +
+								'FROM PACLOADER P ' +
+
+								'JOIN [' + @ControlServerName + '].Control.dbo.Client CL ' +
+								'ON (P.OriginalCID = CL.CL_CID) ' +
+							    'JOIN [' + @ControlServerName + '].Control.dbo.ReAssignBillingClient RBC ' +
+
+								'ON (RBC.RBC_ProcessingCID = CL.CL_ID AND ' +
+									'SUBSTRING(P.' + @ArgumentField + ',' + @Offset + ',' + @Length + ')  = RBC.RBC_Value)'
+
+--PRINT @SQLString
+				EXEC (@SQLString)
+				SELECT @ErrCode = @@ERROR, @CountTest2 = @@ROWCOUNT
+			
+				IF @ErrCode <> 0 
+				    BEGIN
+					 INSERT LoadLog
+					 SELECT GETDATE(),'', @CountTest2, @EarliestDate, '', 93
+			
+				     SET @Messagex = 'Attempt to re-assign CIDs in PACLOADER failed. Error Code: ' + STR(@ErrCode)
+			             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+				     GOTO BAD_EOJ
+				    END
+
+			   -- Get the next argument field name.
+			   FETCH NEXT FROM RBC 
+			   INTO @ArgumentField, @Offset, @Length
+			END
+
+		CLOSE RBC
+		DEALLOCATE RBC
+   END
+
+
+
+-- Eliminate test batches, dummy CIDs and non-standard CIDs
+-- 06/13/05 BAR - Eliminate records with special characters in CID
+-- 06/07/05 BAR - Eliminate records with null CIDs
+
+	DELETE PACLOADER
+        WHERE ((Sys IN ('1','2')) AND (BAT = 'T')) OR
+              ((Sys = '3') AND (SUBSTRING(BAT,1,1) = 'T') AND (SUBSTRING(BAT,2,1) BETWEEN 'A' AND 'Z')) OR
+			  (OriginalCID IN ('ONT','TST','XDR','XXX','ZZZ')) OR
+			  (CHARINDEX('_',OriginalCID) > 0) OR
+			  (CHARINDEX('"',OriginalCID) > 0) OR
+			  (CHARINDEX('!',OriginalCID) > 0) OR
+			  (CHARINDEX('@',OriginalCID) > 0) OR
+			  (CHARINDEX('#',OriginalCID) > 0) OR
+			  (CHARINDEX('$',OriginalCID) > 0) OR
+			  (CHARINDEX('%',OriginalCID) > 0) OR
+			  (CHARINDEX('^',OriginalCID) > 0) OR
+			  (CHARINDEX('&',OriginalCID) > 0) OR
+			  (CHARINDEX('*',OriginalCID) > 0) OR
+			  (CHARINDEX('(',OriginalCID) > 0) OR
+			  (CHARINDEX(')',OriginalCID) > 0) OR
+			  (CHARINDEX('-',OriginalCID) > 0) OR
+			  (CHARINDEX('+',OriginalCID) > 0) OR
+			  (CHARINDEX('=',OriginalCID) > 0) OR
+			  (CHARINDEX(':',OriginalCID) > 0) OR
+			  (CHARINDEX(';',OriginalCID) > 0) OR
+			  (CHARINDEX('?',OriginalCID) > 0) OR
+			  (CHARINDEX('/',OriginalCID) > 0) OR
+			  (CHARINDEX('>',OriginalCID) > 0) OR
+			  (CHARINDEX('<',OriginalCID) > 0) OR
+			  (CHARINDEX('{',OriginalCID) > 0) OR
+			  (CHARINDEX('}',OriginalCID) > 0) OR
+			  (CHARINDEX('[',OriginalCID) > 0) OR
+			  (CHARINDEX(']',OriginalCID) > 0) OR
+			  (CHARINDEX('|',OriginalCID) > 0) OR
+			  (CHARINDEX('\',OriginalCID) > 0) OR
+			  (CHARINDEX('.',OriginalCID) > 0) OR
+			  (CHARINDEX(',',OriginalCID) > 0) OR
+			  (CHARINDEX('~',OriginalCID) > 0) OR
+			  (CHARINDEX('`',OriginalCID) > 0) OR
+			  (CHARINDEX('?OriginalCID) > 0) OR
+             			  (Prt = 'JTST') OR
+			  (ISNUMERIC(SUBSTRING(CID,1,1)) = 1) OR
+	  	  	  (ISNUMERIC(SUBSTRING(CID,2,1)) = 1) OR		
+	  	  	  (ISNUMERIC(SUBSTRING(CID,3,1)) = 1) OR
+			  (LEN(OriginalCID) < 3) OR
+			  (OriginalCID IS NULL)
+
+	SELECT @ErrCode = @@ERROR, @CountTest2 = @@ROWCOUNT
+
+	IF @ErrCode <> 0 
+	    BEGIN
+		 INSERT LoadLog
+		 SELECT GETDATE(),'', @CountTest2, @EarliestDate, '', 93
+
+	     SET @Messagex = 'Attempt to purge Test batches, dummy CIDs and non-standard CIDs from PACLOADER failed. Expected adds:' + @CountTest + ' Actual:' + @CountTest2 + '. Error Code: ' + STR(@ErrCode)
+             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     GOTO BAD_EOJ
+	    END
+
+-- 04/05/05 - Check for new "B" values in Type
+	TRUNCATE TABLE CheckType
+
+    INSERT CheckType
+	SELECT DISTINCT Type
+	FROM PACLOADER
+	WHERE SUBSTRING(Type,1,1) = 'B' AND
+          SDT > '02-28-05'
+
+	DELETE CT
+	FROM CheckType CT
+	JOIN [PIPPIN\PROD].Control.dbo.Component C
+	ON (C.C_Name = CT.Type)
+
+	IF (SELECT COUNT(*) FROM CheckType) > 0
+	BEGIN
+		SET @Messagex = 'Unknown Type(s) found in PAC data. Please fix and restart the MOAT load.'
+        EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	    GOTO BAD_EOJ
+	END
+
+	
+-- Trap for duplicate records
+		TRUNCATE TABLE WORKPACMASTER
+		
+		INSERT WORKPACMASTER
+		SELECT [CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], ARMSFlag, APrt, [HF], [DN], OriginalCID, [ResultCode] 
+		FROM PACLOADER
+		GROUP BY [CID], [Ltr], [Svc], [Prt], [PSF], [Cus], [Type], [RID], [SC], [TFG], [DNA], [DN2], [DA1], [NA1], [DA2], [NA2], [DCT], [DST], [DZP], [NCT], [NSt], [NZp], [Dlr], [PH1], [ACC], [MAS], [ZBr], [TAG], [SDT], [BAT], [DCD], [NCD], [MTP], [MDT], [NIX], [Z4N], [AudAmt], [ACS], [CMNo], [C39], [POS], [BAd], [PrinterType], [PostageType], [V01], [V02], [V03], [V04], [V05], [V06], [V07], [V08], [V09], [V10], [V11], [V12], [V13], [V14], [V15], [V16], [V17], [V18], [V19], [V20], [V21], [V22], [V23], [V24], [V25], [V26], [V27], [V28], [V29], [V30], [V31], [V32], [V33], [V34], [V35], [V36], [V37], [V38], [V39], [V40], [V41], [V42], [V43], [V44], [V45], [V46], [V47], [V48], [V49], [V50], [V51], [V52], [V53], [V54], [V55], [V56], [V57], [V58], [V59], [V60], [V61], [V62], [V63], [V64], [V65], [V66], [V67], [V68], [V69], [V70], [V71], [V72], [V73], [V74], [V75], [V76], [V77], [V78], [V79], [V80], [V81], [V82], [V83], [V84], [V85], [V86], [V87], [V88], [V89], [V90], [V91], [V92], [V93], [V94], [V95], [V96], [V97], [Sys], ARMSFlag, APrt, [HF], [DN], OriginalCID, [ResultCode]
+		HAVING COUNT(*) > 1
+				
+		SET @CountTest2 = @@ROWCOUNT
+
+        IF @CountTest2 > 0
+            BEGIN
+	     SET @Messagex = STR(@CountTest2 - @CountTest3) + ' Duplicate records found in data for ' + CONVERT(varchar(8), @EarliestDate,10) + '. Duplicates are stored in WORKPACMASTER. If there are true duplicates, remove those. If the apparent duplicates really should be unique, modify them to make them unique. Then clear the N status from LoadLog and restart the MOAT load.'
+             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     GOTO BAD_EOJ	      
+	    END
+
+-- Trap for duplicate CID, SDT, RID, BAT and sequester if duplicates
+-- BAR 03/09/04 - Add BAT to the criteria for duplicates
+		TRUNCATE TABLE WORKPACMASTER
+		
+		INSERT WORKPACMASTER
+		(OriginalCID, SDT, RID, BAT)
+		SELECT [OriginalCID], [SDT], [RID], [BAT]
+		FROM PACLOADER P
+-- 		JOIN Client CL
+-- 		ON (CL.CL_CID = P.CID AND
+-- 			CL.CL_ACS IN ('S','V')) -- ACS active in SQL or VFP
+		GROUP BY [OriginalCID], [RID], [SDT], [BAT]
+		HAVING COUNT(*) > 1
+				
+		SET @CountTest2 = @@ROWCOUNT
+
+		INSERT PACHOLD_DuplicateRIDs
+		SELECT *
+		FROM PACLOADER P
+		WHERE OriginalCID + RID + BAT + CONVERT(varchar(8),SDT,10) IN (SELECT OriginalCID + RID + BAT + CONVERT(varchar(8),SDT,10) FROM WORKPACMASTER)
+		
+		DELETE PACLOADER
+		WHERE OriginalCID + RID + BAT + CONVERT(varchar(8),SDT,10) IN (SELECT OriginalCID + RID + BAT + CONVERT(varchar(8),SDT,10) FROM WORKPACMASTER)
+
+        IF @CountTest2 > 0
+            BEGIN
+	     SET @Messagex = STR(@CountTest2 - @CountTest3) + ' Duplicate CID/SDT/RID/BAT found in data on ' + CONVERT(varchar(8), @EarliestDate,10) + '. Duplicates are sequestered in PACHOLD_DuplicateRIDs. Refer to the MOAT Troubleshooting Guide for further instructions.'
+		 SET @Subjectx = 'MOAD Load - Records with duplicate CID/SDT/RID/BAT found'
+		 SET @Recipientsx = 'MOAD-Dups'
+         EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+		 SET @Subjectx = 'MOAD Load error'
+		 SET @Recipientsx = 'MOAD-Admin'
+	    END
+
+-- Eliminate records with null SDT
+		IF (SELECT COUNT(SDT) FROM PACLOADER WHERE SDT IS NULL) > 0
+		BEGIN
+			INSERT PAC_NullDate
+			SELECT * FROM PACLOADER 
+			WHERE SDT IS NULL
+
+			SELECT @ErrCode = @@ERROR, @CountTest2 = @@ROWCOUNT
+		
+			IF @ErrCode <> 0 
+			    BEGIN
+			     SET @Messagex = 'Attempt load null-dated PACLOADER records to PAC_NullDate failed. Error Code: ' + STR(@ErrCode)
+		             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+			     GOTO BAD_EOJ
+			    END
+	
+			DELETE PACLOADER
+			WHERE SDT IS NULL
+	
+			IF @ErrCode <> 0 
+			    BEGIN
+			     SET @Messagex = 'Attempt delete null-dated records from PACLOADER failed. Error Code: ' + STR(@ErrCode)
+		             EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+			     GOTO BAD_EOJ
+
+			    END
+
+		END
+
+-- Are there any trailer detail records that have no
+-- associated trailer header records?
+    TRUNCATE TABLE WORKTEMP10
+
+    INSERT WORKTEMP10
+	SELECT DISTINCT OriginalCID, Prt, Ltr, RID, SC, BAT
+	FROM PACLOADER
+	WHERE Prt > '0' AND
+	Type IN ('Tr','TrDt','TrLr')
+	
+	DELETE W
+	FROM WORKTEMP10 W
+	JOIN PACLOADER P
+	ON (W.CID = P.OriginalCID AND
+	    W.Prt = P.Prt AND
+	    W.Ltr = P.Ltr AND
+        W.SC  = P.SC AND
+		W.BAT = P.BAT AND
+		P.Type = 'TrHd')
+
+
+-- If orphans and if Set Count (SC) = 1, then
+-- change the orphaned trailer detail records to trailer header records
+	SET @CountTest2 =  (SELECT COUNT(P.OriginalCID) 
+					    FROM PACLOADER P
+						JOIN WORKTEMP10 W
+						ON (W.CID = P.OriginalCID AND
+						    W.Prt = P.Prt AND
+						    W.Ltr = P.Ltr AND
+						    W.RID = P.RID AND
+							W.BAT = P.BAT AND
+							P.SC = 1))
+
+	UPDATE P
+	SET Type = 'TrHd'
+	FROM PACLOADER P
+	JOIN WORKTEMP10 W
+	ON (W.CID = P.OriginalCID AND
+	    W.Prt = P.Prt AND
+	    W.Ltr = P.Ltr AND
+		W.RID = P.RID AND
+		W.BAT = P.BAT AND
+		P.SC = 1)
+	
+	SELECT @ErrCode = @@ERROR, @CountTest4 = @@ROWCOUNT
+	
+	IF @CountTest2 <> @CountTest4
+	    BEGIN
+	     SET @Messagex = 'Attempt to change orphaned trailer detail records to trailer header records in PACLOADER failed. Expected count:' + LTRIM(STR(@CountTest2)) + ' Actual count:' + LTRIM(STR(@CountTest4)) + '  Error Code: ' + STR(@ErrCode)
+	     EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     GOTO BAD_EOJ
+
+	    END
+
+--SELECT * FROM WORKTEMP10
+-- If orphans and if Set Count (SC) <> 1, then
+-- we look at the row with the next lower RID. If it's a 
+-- trailer header, has Prt = NULL, has the same SC and the same
+-- CID, then set Prt = NULL on the orphaned trailer details
+
+-- Isolate the rows with the lowest value RIDs by CID
+	SELECT W.CID, W.Prt, W.Ltr, W.SC, MIN(W.RID) AS RID, W.BAT AS BAT
+	INTO #Orphan
+	FROM PACLOADER P
+		   JOIN WORKTEMP10 W
+		   ON (W.CID = P.OriginalCID AND
+	    	   W.Prt = P.Prt AND
+	    	   W.Ltr = P.Ltr AND
+			   W.SC  = P.SC AND
+               W.RID = P.RID AND
+			   W.BAT = P.BAT AND
+			   P.SC <> 1)
+	GROUP BY W.CID, W.Prt, W.Ltr, W.SC, W.BAT
+
+--SELECT * FROM #ORPHAN
+
+-- 	Isolate the parent records by finding the next lower RIDs
+--  NOTE: PAC1 and PAC2 RIDs have alpha prefixes, so we have
+--		  to look at the last 5 character substring to
+--		  get pure numerics for the calculation.
+	SELECT O.CID, O.Prt AS OPrt, O.Ltr AS OLtr, P.Ltr AS PLtr, P.Prt AS PPrt, O.SC, O.RID AS ORID, P.RID AS PRID, P.BAT AS PBAT
+	INTO #OrphanAndParent
+	FROM #Orphan O
+	JOIN PACLOADER P
+	ON (
+		O.CID = P.OriginalCID AND
+		O.BAT = P.BAT AND
+--	    O.SC  = P.SC AND
+--	    P.Prt IS NULL AND
+	    (CONVERT(int,RIGHT(RTRIM(P.RID),5)) = CONVERT(int,RIGHT(RTRIM(O.RID),5) - 1)) AND
+		 (SUBSTRING(P.RID,1,1) = SUBSTRING(O.RID,1,1) OR SUBSTRING(P.RID,1,3) = SUBSTRING(O.RID,1,3)))
+
+--SELECT * FROM WORKTEMP10
+--SELECT * FROM #OrphanAndParent
+
+
+
+-- Set the trailer detail Prt to NULL	
+	UPDATE P
+	SET Prt = NULL,
+        Ltr = OP.PLtr
+	FROM PACLOADER P
+    JOIN WORKTEMP10 W
+    ON (P.RID = W.RID)
+	JOIN #OrphanAndParent OP
+	ON (OP.CID = P.OriginalCID AND
+	    OP.OPrt = P.Prt AND
+	    OP.OLtr = P.Ltr AND
+		OP.PBAT = P.BAT AND
+	    OP.SC = P.SC)
+
+	SELECT @ErrCode = @@ERROR, @CountTest4 = @@ROWCOUNT
+
+	INSERT LoadLog
+	SELECT GETDATE(),'', @CountTest4,@EarliestDate, '', 109
+	
+
+	IF @ErrCode <> 0
+	    BEGIN
+	     SET @Messagex = 'Attempt to update orphaned trailer detail records to set their Prt to NULL in PACLOADER failed. Error Code: ' + STR(@ErrCode)
+	     EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     GOTO BAD_EOJ
+
+	    END
+
+-- Remove the references to the fixed trailer detail rows
+	DELETE W
+	FROM WORKTEMP10 W
+	JOIN #OrphanAndParent OP
+	ON (OP.CID = W.CID AND
+	    OP.OPrt = W.Prt AND
+	    OP.OLtr = W.Ltr AND
+        OP.ORID = W.RID AND
+		OP.PBAT = W.BAT AND
+        OP.SC = W.SC)
+
+-- SELECT * FROM WORKTEMP10	 
+-- Now, are there still orphaned trailer detail records left?
+-- If so, we have a problem, so sound the alarm
+   IF (SELECT COUNT(P.CID)
+	   FROM PACLOADER P
+	   JOIN WORKTEMP10 W
+	   ON (W.CID = P.OriginalCID AND
+    	   W.Prt = P.Prt AND
+		   W.RID = P.RID AND
+    	   W.Ltr = P.Ltr AND
+		   W.BAT = P.BAT AND
+		   P.SC <> 1)) <> 0
+	    BEGIN
+		 SET @QueryString = 'SELECT W.CID, W.Prt, W.Ltr, P.Type, W.SC, W.RID, CONVERT(char(8),SDT,10) AS SDT, P.BAT, P.Sys	
+							 FROM [' + @@SERVERNAME + '].MOAD.dbo.PACLOADER P 
+							 JOIN [' + @@SERVERNAME + '].MOAD.dbo.WORKTEMP10 W 
+							 ON (W.CID = P.OriginalCID AND 
+								 W.Prt = P.Prt AND	
+								 W.Ltr = P.Ltr AND
+								 W.RID = P.RID AND
+								 W.BAT = P.BAT AND
+								 P.SC <> 1)
+							 ORDER BY W.CID, W.RID, W.Prt, W.Ltr'
+		 SET @Messagex = 'These are orphaned trailer detail records in PACLOADER and their SC' + CHAR(13) + CHAR(10) +
+						 ' values are not 1, so changing them to trailer headers was not' + CHAR(13) + CHAR(10) + 
+						 ' warranted. The most likely reason for this problem is that a trailer' + CHAR(13) + CHAR(10) +
+						 ' header record has had the Prt value changed to NULL so it will not' + CHAR(13) + CHAR(10) +
+						 ' get printed, but one or more of the trailer detail records (ie Type = Tr, TrDt or TrLr)' + CHAR(13) + CHAR(10) +
+						 ' have not followed suit. Refer to the MOAT Troubleshooting Guide to fix the problem.'
+		 SET @Subjectx = 'Unresolvable orphaned trailer records in PACLOADER'
+	 	 EXEC @EmailStat = dbo.psp_EmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @QueryString, @AttachResults
+
+		 GOTO BAD_EOJ
+	    END
+
+	DROP TABLE #Orphan
+	DROP TABLE #OrphanAndParent
+
+
+	-- Get record count of PACLOADER
+	SET @CountTest = (SELECT COUNT(OriginalCID) FROM PACLOADER)
+	
+	INSERT LoadLog
+	SELECT GETDATE(),'', @CountTest,@EarliestDate, '', 6
+
+--************* MISSING CID ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoCID @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+
+-- ************* MISSING LETTER ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoLtr @EarliestDate
+        IF @ReturnStatus = 0
+
+
+
+           GOTO BAD_EOJ
+
+-- 04/16/04 BAR - Disable this SP call until all client/component prices
+--				  have been set by accounting
+-- ************* MISSING LETTER PRICE ********************************
+--         EXEC @ReturnStatus = psp_TransformClassicPACDataNoLtrPrice @EarliestDate
+--         IF @ReturnStatus = 0
+--            GOTO BAD_EOJ
+
+-- 07/22/04 BAR - Re-instated - not needed for component-based pricing, but
+--				  is required for invoice line item text.
+-- 02/24/04 BAR - Comment out - not needed for Component-based pricing
+-- ************* MISSING VALUE FOR HasReturnEnvelope ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoHasReturnEnvValue @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+-- ************* MISSING NCOA Client_Component ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoNCOA @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+-- ************* MISSING NCOA Phone Search Client_Component ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoNCOAPhone @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+-- ************* MISSING BATCHES ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataNoBatch @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+--************* MISSING NCOA-RELATED COMPONENT PRICING ********************************
+-- 06/14/04 - Eliminated by BAR. This is now taken care of in 
+--			  psp_SynchSIXPACtoPACx_AddNewLetters in PIPPIN\PROD.Control
+-- NOTE: This is just for 3rd-party and in-house data cleansing components
+--         EXEC @ReturnStatus = psp_TransformClassicPACDataNoCompPrice @EarliestDate
+--         IF @ReturnStatus = 0
+--            GOTO BAD_EOJ
+
+-- Are there any records left in PACLOADER to be processed for this day?
+-- If not, skip to the logic that drops this day's data from PACMASTER
+		IF (SELECT COUNT(CID) FROM PACLOADER) = 0
+			GOTO LOAD_SKIPPED
+
+--************* Phantom Prt/Ltr combinations ****************************
+-- 06-30-05 BAR 
+--		- Create the new Prt/Ltr combinations in LegacyStaging.LETTER
+-- 		- Create the new Prt/Ltr combinations in LegacyStaging.NewLETTER
+--		- Load WORKTEMP10 with the new CID\Prt\Ltr combinations
+-- 		- Create new phantom print group TransSpec letter records
+--      - Append '-' and Prt to Ltr for all phantom print group letters
+
+TRUNCATE TABLE WORKPhantomPrtGrp
+
+IF @@SERVERNAME = 'GANDALF\MOAD'
+	EXEC @ReturnStatus = [PIPPIN\PROD].Control.dbo.psp_SPA_AddNewPrtGrpAndLetterCombinations
+IF @@SERVERNAME = 'ARAGORN\DEV'
+	EXEC @ReturnStatus = [ARAGORN\TEST].Control.dbo.psp_SPA_AddNewPrtGrpAndLetterCombinations
+
+PRINT @ReturnStatus
+PRINT 'After psp_SPA_AddNewPrtGrpAndLetterCombinations'
+
+IF @ReturnStatus <> 0
+BEGIN
+	PRINT @ReturnStatus
+	PRINT 'After IF @ReturnStatus <> 0'
+   GOTO BAD_EOJ
+END
+
+PRINT 'Before INSERT LoadLog 124'
+
+INSERT LoadLog
+	SELECT GETDATE(),'', 0, @EarliestDate, '', 124
+
+-- 10/15/05 BAR - Use OriginalCID instead of CID in PACLOADER
+--							when assigning TSP_IDs
+-- 06-30-05 BAR - Change the letter number if the print group for this
+-- 				  letter was changed during PAXc processing.
+
+	SET @CountTest = (SELECT COUNT(*) 
+					  FROM PACLOADER P
+					  JOIN WORKPhantomPrtGrp W
+					  ON (LEN(P.Ltr) < 6 AND  -- if printgroup has not already been appended
+			            	P.OriginalCID = W.CID AND
+					    	P.Prt = W.Prt AND
+					    	P.Ltr = W.Ltr))
+
+		UPDATE P
+		SET P.Ltr = P.Ltr + '-' + P.Prt
+		FROM PACLOADER P
+		JOIN WORKPhantomPrtGrp W
+		ON (LEN(P.Ltr) < 6 AND  -- if printgroup has not already been appended
+            P.OriginalCID = W.CID AND
+		    P.Prt = W.Prt AND
+		    P.Ltr = W.Ltr)
+
+	SELECT @ErrCode = @@ERROR, @Counter = @@ROWCOUNT
+	IF @ErrCode <> 0 
+	    BEGIN
+	      SET @Messagex = 'Failed to rename in PACLOADER those letters with re-assigned print groups. Error Code: ' + STR(@ErrCode)
+	      EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	      GOTO BAD_EOJ
+	    END
+
+	IF @CountTest <> @Counter
+		BEGIN
+	      SET @Messagex = 'Record count error. Expected to rename ' + LTRIM(STR(@CountTest)) + ' letters with re-assigned print groups in PACLOADER but ' + LTRIM(STR(@Counter) + ' were actually renamed.')
+	      EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	      GOTO BAD_EOJ
+	    END
+
+INSERT LoadLog
+	SELECT GETDATE(),'', 0, @EarliestDate, '', 125
+
+-- ************* LOAD MOAT TABLE ********************************
+        EXEC @ReturnStatus = psp_TransformClassicPACDataLoadMOAT @EarliestDate
+        IF @ReturnStatus = 0
+           GOTO BAD_EOJ
+
+
+
+
+
+-- Call the remainder of the processing
+-- 05/12/02 - This section was broken out to try to solve the problem of the stored 
+-- procedure hanging interminably after the above query finished.
+	EXEC @ReturnStatus = psp_TransformClassicPACData2 @EarliestDate
+        IF @ReturnStatus = 0
+	    GOTO BAD_EOJ 
+
+	SET @Counter = (SELECT SUM(LL_Count)
+	FROM LoadLog
+	WHERE EV_ID IN (3,4, 28) AND
+	      LL_Stamp BETWEEN @StartTime AND @EndTime)
+	
+	SET @WorkInt = (SELECT SUM(LL_Count) FROM LoadLog
+			WHERE EV_ID = 21 AND
+	      		LL_Stamp BETWEEN @StartTime AND @EndTime)
+	IF @Counter <> @WorkInt
+	    	BEGIN
+	        SET @Messagex = 'Sum of codes 3, 4 and 28 (' + STR(@Counter) + ') <> Code 21 (' + STR(@WorkInt) + ')'
+                EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	           SELECT @BadCounts1 = 'Y'
+	        END
+	
+	SET @Counter = (SELECT SUM(LL_Count)
+	FROM LoadLog
+	WHERE EV_ID IN (8,11,14,17,36,39,20,21)AND
+	      LL_Stamp BETWEEN @StartTime AND @EndTime)
+	
+	SET @WorkInt = (SELECT SUM(LL_Count) FROM LoadLog
+			  WHERE EV_ID = 6 AND
+	      			LL_Stamp BETWEEN @StartTime AND @EndTime)
+	IF @Counter <> @WorkInt
+	    BEGIN
+	       SET @Messagex = 'Sum of codes 8,11,14,17,36,39,20 and 21 (' + STR(@Counter) + ') <> Code 6 (' + STR(@WorkInt) + ')'
+               EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	       SELECT @BadCounts2 = 'Y'
+	    END
+	
+	IF @BadCounts1 = 'Y' or @BadCounts2 = 'Y'
+	   GOTO BAD_EOJ
+
+
+-- Create log entry for each batch loaded
+	INSERT LoadLog
+        (LL_Stamp, LL_ErrorText,LL_Count, LL_Date, LL_Flag, EV_ID)
+	SELECT DISTINCT GETDATE(), 'PAC' + Sys + ' ' + BAT, COUNT(BAT), SDT,'',56    
+	FROM PACMASTER WHERE SDT = @EarliestDate
+	GROUP BY SDT, Sys, BAT
+	ORDER BY SDT
+
+LOAD_SKIPPED:
+-- Delete day from PACMASTER
+        IF (SELECT COUNT(DISTINCT SDT) FROM PACMASTER) = 1
+
+	   TRUNCATE TABLE PACMASTER
+        ELSE
+        BEGIN
+		DELETE PACMASTER
+		WHERE SDT = @EarliestDate
+
+		SELECT @ErrCode = @@ERROR, @CountTest = @@ROWCOUNT
+		IF @ErrCode <> 0 
+	    	BEGIN
+	     	SET @Messagex = 'Attempt to delete transformed PACMASTER records failed. Error Code: ' + STR(@ErrCode)
+             	EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+	     	GOTO BAD_EOJ
+
+	    	END
+	END
+
+	INSERT LoadLog
+	SELECT GETDATE(),'', @CountTest,@EarliestDate, '', 43
+	
+
+/* Drop PACLOADER indices to optimize loading from the classic PAC system the
+next time psp_LoadPACLOADERToMOAT runs and from PACHOLD the next time this
+stored procedure runs.
+*/
+
+	TRUNCATE TABLE PACLOADER
+
+	INSERT LoadLog
+	SELECT GETDATE(), '', 0,@EarliestDate, '', 46
+
+
+	SET @PACLOADERTargetCount = 0
+
+-- This END closes the WHILE loop that serially processes batches
+END
+
+	INSERT LoadLog
+	SELECT GETDATE(), '', 0,@EarliestDate, '', 55
+
+-- No more PACMASTER batches to process
+
+EXITJOB:
+
+-- 12-02-03 BAR Moved truncation of FROMPACWORK.DBO.PACMASTERPOOL to
+-- 				immediately after loading from it to PACMASTER.
+--				This eliminates the possibility of losing data
+--				on a restart.
+--		TRUNCATE TABLE FROMPACWORK.dbo.PACMASTERPOOL		
+		TRUNCATE TABLE WORKTEMP
+	    IF @@ServerName = 'GANDALF\MOAD'
+			INSERT WORKTEMP
+			(F1,F3,CL_ID)
+			SELECT DISTINCT CL.CL_CID,TSP.TSP_Name,CL.CL_ID
+			FROM [PIPPIN\PROD].Control.dbo.TransSpec TSP
+			JOIN [PIPPIN\PROD].Control.dbo.Client CL 
+			ON (TSP.CL_ID = CL.CL_ID)
+			WHERE TSP.TSP_Price = 0 
+	
+		IF @@SERVERNAME = 'ARAGORN\DEV'
+			INSERT WORKTEMP
+			(F1,F3,CL_ID)
+			SELECT DISTINCT CL.CL_CID,TSP.TSP_Name,CL.CL_ID
+			FROM [ARAGORN\TEST].Control.dbo.TransSpec TSP
+			JOIN [ARAGORN\TEST].Control.dbo.Client CL 
+			ON (TSP.CL_ID = CL.CL_ID)
+			WHERE TSP.TSP_Price = 0 	
+-- Remove references to legitimately zero-priced letters
+
+-- 1. Where there is a price override
+	    IF @@ServerName = 'GANDALF\MOAD'
+			DELETE WORKTEMP
+			FROM WORKTEMP W
+			JOIN [PIPPIN\PROD].Control.dbo.TransPriceOverride TPO
+			ON (W.CL_ID = TPO.CL_ID AND
+				W.F3 = TPO.TSP_Name AND
+				TPO.TPO_Price = 0)
+
+		IF @@SERVERNAME = 'ARAGORN\DEV'
+			DELETE WORKTEMP
+			FROM WORKTEMP W
+			JOIN [ARAGORN\TEST].Control.dbo.TransPriceOverride TPO
+			ON (W.CL_ID = TPO.CL_ID AND
+				W.F3 = TPO.TSP_Name AND
+				TPO.TPO_Price = 0)
+
+-- 07/14/04 BAR - Exclude ZZZ (Compumail dummy client)
+	DELETE WORKTEMP
+	WHERE F1 = 'ZZZ'
+
+	IF @@ServerName = 'GANDALF\MOAD'
+		DELETE W
+		FROM WORKTEMP W
+		JOIN [PIPPIN\PROD].Control.dbo.TestClients T
+		ON (T.CID = W.F1)
+
+	IF @@SERVERNAME = 'ARAGORN\DEV'
+		DELETE W
+		FROM WORKTEMP W
+		JOIN [ARAGORN\TEST].Control.dbo.TestClients T
+		ON (T.CID = W.F1)
+
+-- 04/16/04 BAR - Reinstate this function when all components are priced
+--				  by accounting.	 
+-- ** 04/07/04 BAR - Eliminate printgroup for component-based pricing		
+        IF (SELECT COUNT(*) FROM WORKTEMP) > 0
+		BEGIN
+			SET @ExecString = 'SELECT DISTINCT W.F1 AS CID, F3 AS Ltr
+			FROM [' + @@SERVERNAME + '].MOAD.dbo.WORKTEMP W
+			ORDER BY W.F1, W.F3'
+			SET @Recipientsx = 'Acctg-Billing'
+			SET @Messagex = 'These Client letters have zero prices in SIXPAC. Please verify that their components are properly priced.'
+			SET @Subjectx = 'Client letters with zero prices in SIXPAC'
+			EXEC @EmailStat = dbo.psp_EmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+		END
+	
+
+
+        IF (SELECT COUNT(DISTINCT SDT) FROM PACHOLD) > 0
+        BEGIN
+			SET @ExecString = 'SELECT DISTINCT CID, 
+			CONVERT(char(8),SDT,10) AS Date, 
+			ISNULL(CONVERT(char(8),CL_InvoicingStartDate,10),'''') AS SPA 
+			FROM [' + @@SERVERNAME + '].MOAD.dbo.PACHOLD P
+            JOIN [' + @ControlServerName + '].COntrol.dbo.Client CL
+	        ON (P.CID = CL.CL_CID)
+			ORDER BY CONVERT(char(8),SDT,10)'
+			SET @Messagex = 'Client data for the following dates is on hold for lack of SIXPAC Admin information.'
+			SET @Subjectx = 'Days for which client production data remains unprocessed and unpriced:'
+			SET @Recipientsx = 'Acctg-Billing'
+			EXEC @EmailStat = dbo.psp_EmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+	    END
+	
+	SET @EndTime = GETDATE()
+	INSERT LoadLog
+	SELECT GETDATE(), 'Minutes:' + CONVERT(varchar(10),DATEDIFF(mi,@StartTime,@EndTime)), 0,@EarliestDate, '', 44
+
+	SET @EndTime = GETDATE()
+		SET @ExecString = 'SELECT CONVERT(varchar(8),LL_Stamp,1) + '' '' + 
+						   CONVERT(varchar(8),LL_Stamp,8) AS Posted, 
+						   LL_Count AS Counts, 
+						   CONVERT(varchar(8),LL_Date,1) AS Processed, 
+						   SUBSTRING(LL_ErrorText,1,25) AS Msg, LL_Flag AS Flag, 
+						   EV_ID AS EID  
+						   FROM [' + @@SERVERNAME + '].MOAD.dbo.LoadLog 
+						   WHERE LL_Stamp BETWEEN  ''' + CONVERT(char(19),@StartTime,21) + 
+					   ''' AND ''' +  CONVERT(char(19),@EndTime,21) + ''''
+    SET @Messagex = 'MOAT Load Log for batches loaded today'
+	SET @Subjectx = 'MOAT Load Log'
+    SET @Recipientsx = 'MOAD-Admin'
+    EXEC @EmailStat = dbo.psp_EmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+
+-- 04/19/05 BAR - Add refresh of Daily Count tables
+EXEC dbo.psp_RefreshDailyCountTable
+
+-- 10/26/05 BAR - Add refresh of ReportCR517 table
+EXEC dbo.psp_RptCR517_CFD_DailyCertifiedLetters
+
+-- 07/19/05 BAR - Add refresh of postage and service balances
+-- IF @@SERVERNAME = 'GANDALF\MOAD'
+-- 	EXEC @ReturnStatus = [PIPPIN\PROD].Control.dbo.psp_UpdateClientPostageAccounts
+-- IF @@SERVERNAME = 'ARAGORN\DEV'
+-- 	EXEC @ReturnStatus = [ARAGORN\TEST].Control.dbo.psp_UpdateClientPostageAccounts
+-- 
+-- IF @ReturnStatus <> 0
+--  BEGIN
+-- 	SET @Messagex = 'Failed to refresh postage and service balances using [PIPPIN\PROD].Control.dbo.psp_UpdateClientPostageAccounts'
+-- 	SET @Subjectx = 'MOAT Load Log'
+--     SET @Recipientsx = 'MOAD-Admin'
+--     EXEC @EmailStat = dbo.psp_EmailSend @Recipientsx, @Subjectx, @Messagex, @PgmName
+-- 	GOTO BAD_EOJ
+--  END
+
+-- 07/19/05 BAR - Add test for problem postage balances
+IF @@SERVERNAME = 'GANDALF\MOAD'
+	EXEC [PIPPIN\PROD].Control.dbo.psp_ReportProblemPostageBalances
+IF @@SERVERNAME = 'ARAGORN\DEV'
+	EXEC [ARAGORN\TEST].Control.dbo.psp_ReportProblemPostageBalances
+
+SET NOCOUNT OFF
+RETURN 1
+
+-- We have a problem!
+
+BAD_EOJ:
+BEGIN
+  INSERT LoadLog
+  SELECT GETDATE(),SUBSTRING(@Messagex,1,120), @CountTest, @EarliestDate, 'N', 32
+  SET NOCOUNT OFF
+  RETURN 0
+END
+/*
+SET XACT_ABORT OFF
+*/
+
+
+
+
+
+
+
+GO
+SET QUOTED_IDENTIFIER OFF 
+GO
+SET ANSI_NULLS ON 
+GO
+

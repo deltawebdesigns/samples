@@ -1,0 +1,1415 @@
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_ARMS1_PostToReturnMailData]    Script Date: 04/30/2012 09:08:21 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+/*
+**
+** 11/12/10 BAR ChgReq 477 noted out code for ARAGORN
+*/
+
+ALTER PROCEDURE [dbo].[psp_ARMS1_PostToReturnMailData]
+AS
+
+DECLARE @Status varchar(200)
+DECLARE @Subjectx varchar(100)
+DECLARE @Messagex varchar(1000)
+DECLARE @Recipientsx varchar(100)
+DECLARE @ExecString nvarchar(4000)
+DECLARE @AttachResults char(5)
+DECLARE @EmailStat int
+DECLARE @PgmName varchar(100)
+DECLARE @AttachResultsx char(5)
+DECLARE @RowCnts int
+DECLARE @RowCnts1 VARCHAR(100)
+DECLARE @Cnt int
+DECLARE @Cnt1 VARCHAR(100)
+Declare @SqlStatement varchar(100)
+
+DECLARE @RMDDate datetime
+SET @RMDDate = dbo.pudf_dateonly(getdate())
+SET @PgmName = 'psp_ARMS1_PostToReturnMailData'
+SET @AttachResults = 'False'
+SET @Recipientsx = 'ARMS-Admin'
+SET @EmailStat = 0
+SET @Subjectx = ''
+SET @EXECSTRING = ''
+set @Status = 0
+
+/*
+***********************************************************************************
+***** GetAcctNoForArms_MailReturnData 
+***********************************************************************************
+*/
+Print 'RMD_KeyLine with #'
+ UPDATE MailReturnData
+ SET RMD_Keyline = '#' + RMD_KeyLine + '#'
+ WHERE SubString(RMD_KeyLine,1,1) <> '#'
+
+CREATE TABLE #WORK
+(RMD_ID int)
+
+DECLARE @BeginRMD_ID int
+DECLARE @EndRMD_ID int
+SET @BeginRMD_ID = (SELECT MIN(RMD_ID) FROM MailReturnData WHERE RMD_DNA IS NULL)
+SET @EndRMD_ID = (SELECT MAX(RMD_ID) FROM MailReturnData WHERE RMD_DNA IS NULL)
+
+INSERT #WORK
+SELECT TOP 100 RMD_ID
+FROM MailReturnData
+WHERE RMD_ID >= @BeginRMD_ID
+ORDER BY RMD_ID
+
+DECLARE @Counter int
+SET @Counter = 0
+
+Print 'Update AcctNo, DNA and Ltr 100 records at a time'
+WHILE (SELECT MAX(RMD_ID) FROM #WORK) <= @EndRMD_ID
+BEGIN
+	UPDATE M
+	SET RMD_AcctNo = T.ACC,
+		RMD_DNA = T.DNA,
+		LTR = T.LTR
+	FROM dbo.MailReturnData M WITH (NOLOCK)
+	JOIN #WORK W ON (M.RMD_ID = W.RMD_ID)
+	JOIN [GANDALF\MOAD].Archive.dbo.PACMASTERPOOL T ON ( M.RMD_KEYLINE  = T.ACS)
+
+	If @@ERROR <> 0
+	BEGIN
+		SET @Status = 'Update for MailReturnData failed when retrieving data from PACMASTERPOOL. Please call Technical support.'
+		GoTo Processing_Error
+	END
+
+	SET @BeginRMD_ID = (SELECT MAX(RMD_ID) FROM #WORK)
+
+	DELETE #WORK
+
+    INSERT #WORK
+	SELECT TOP 100 RMD_ID
+	FROM MailReturnData
+	WHERE RMD_ID > @BeginRMD_ID
+	ORDER BY RMD_ID
+
+	IF @@ROWCOUNT = 0
+		BREAK
+END
+
+DROP TABLE #WORK
+
+/*
+***********************************************************************************
+***** Update_KeyLine_AcsCode_In_Arms  
+***********************************************************************************
+*/
+Print 'Update KeyLine ACS Code in ARMs'
+	UPDATE PostProcess.dbo.MailReturnData
+	SET 
+	RMD_AcsCode = CASE WHEN LEN(dbo.pudf_AllTrim(RMD_AcsCode)) <= 14 THEN dbo.pudf_AllTrim(SUBSTRING(RMD_AcsCode,1,13)) + '9' else RMD_AcsCode END,
+	RMD_KeyLine = CASE WHEN LEN(dbo.pudf_AllTrim(RMD_KeyLine)) <= 17 THEN dbo.pudf_AllTrim(SUBSTRING(RMD_KeyLine,1,16)) + '9#' else RMD_KeyLine END
+	FROM postprocess.dbo.MailReturnData 
+	JOIN control.dbo.Client ON RMD_CID = CL_CID
+	WHERE len(RMD_Keyline) <= 17 AND CL_OldPacSys = 3
+	AND RMD_Date > dbo.pudf_dateonly(@RMDDate)
+
+/*
+***********************************************************************************
+***** InsertReturnMailData_From_MailReturnData 
+***********************************************************************************
+*/
+Print 'Insert ReturnMailData From MailReturnData'
+
+SET @Cnt = (select count(*) knt
+			from PostProcess.dbo.MailReturnData m WITH (NOLOCK)
+			join Control.dbo.Client c WITH (NOLOCK)
+			on  (c.cl_cid = m.rmd_cid))
+SET @CNT1 = @Cnt
+
+-- Insert records FROM MailReturnData into ReturnMailData
+INSERT INTO PostProcess.dbo.ReturnMailData
+( rmd_rectype,rmd_seqno, rmd_parTcode, 
+rmd_keyline,rmd_type,rmd_prime,rmd_direct,
+rmd_streetname, rmd_streetsuffix,rmd_postdirect,
+rmd_unitdesignator,rmd_secondno, rmd_acscode,
+rmd_queued, rmd_date,rmd_acctno, rmd_dna,
+rmd_streetaddr, rmd_streetaddr2, rmd_city, rmd_state, rmd_zip,
+rmd_5digitzip, rmd_hyphen, rmd_zip4, rmd_dpbcinfo,
+rmd_lblformatnewaddr, rmd_movemonth, rmd_moveyear,
+rmd_cid, rmd_processed, cl_ID, rmd_postcard, rmd_user, ltr, rmd_created)
+SELECT rmd_rectype,rmd_seqno, rmd_parTcode, 
+--rmd_keyline,
+--RMD_KeyLine =
+	ISNULL(rmd_CID,'') + ISNULL(rmd_ACSCode,'')
+,
+	CASE
+		WHEN rmd_type IS NULL THEN 'U' ELSE rmd_type
+	END,
+--rmd_prime,
+--RMD_Prime =
+ 	SUBSTRING(CASE
+		WHEN (CHARINDEX(' ',rmd_STREETADDR)-1)> 0 -- there is at least one blank in the street address
+		THEN SUBSTRING(rmd_STREETADDR,1,(CHARINDEX(' ',rmd_STREETADDR)-1))  -- get the string starting at the first position of the street address and ending with the position preceding the first blank
+	ELSE '' --Spaces instead of NULL
+	END,1,10),
+--rmd_direct,
+--RMD_Direct =
+	CASE
+	   WHEN msdb.dbo.pudf_CHARINDEXn(' ',rmd_STREETADDR,2) BETWEEN (CHARINDEX(' ',rmd_STREETADDR)+2) AND (CHARINDEX(' ',rmd_STREETADDR)+3) -- a 1 or 2 character string exists between the 1st and 2nd blank
+	   THEN
+		SUBSTRING(rmd_STREETADDR,
+				(CHARINDEX(' ',rmd_STREETADDR)+1), -- string starts with the character following the first blank
+				 (msdb.dbo.pudf_CHARINDEXn(' ',rmd_STREETADDR,2)) - (CHARINDEX(' ',rmd_STREETADDR)+1)) -- string ends with the character before the 2nd blank
+	ELSE '' --Spaces instead of NULL
+	END,
+--RMD_StreetName
+	CASE WHEN rmd_STREETADDR > '0' -- not null
+		 THEN
+		 CASE
+			WHEN msdb.dbo.pudf_CHARINDEXn(' ',rmd_STREETADDR,2) BETWEEN (CHARINDEX(' ',rmd_STREETADDR)+2) AND (CHARINDEX(' ',rmd_STREETADDR)+3) -- a 1 or 2 character string exists between the 1st and 2nd blank
+			THEN SUBSTRING(LTRIM(rmd_STREETADDR),
+						   msdb.dbo.pudf_CHARINDEXn(' ',rmd_STREETADDR,2) + 1,
+						   100) -- extract everything after the second blank
+		 ELSE SUBSTRING(LTRIM(rmd_STREETADDR),
+						   msdb.dbo.pudf_CHARINDEXn(' ',rmd_STREETADDR,1) + 1,
+						   100) -- extract everything after the first blank
+
+		END
+	else ''
+	END,
+ISNULL(rmd_streetsuffix,''),ISNULL(rmd_postdirect,''),
+rmd_unitdesignator,rmd_secondno, 
+rmd_acscode,rmd_queued, rmd_date,
+ISNULL(rmd_acctno, ''), ISNULL(rmd_dna,''),
+ISNULL(rmd_streetaddr,''), ISNULL(rmd_streetaddr2,''),
+ISNULL(rmd_city, ''), ISNULL(rmd_state, ''),ISNULL(rmd_zip,''),
+CASE WHEN LEN(rmd_zip) > 4 THEN LEFT(rmd_zip,5) ELSE '' END,
+CASE WHEN LEN(rmd_zip) = 10 THEN '-' ELSE '' END,
+CASE WHEN LEN(rmd_zip) = 10 THEN RIGHT(rmd_zip,4) ELSE '' END,
+ISNULL(rmd_dpbcinfo,''),
+ISNULL(rmd_lblformatnewaddr, ''),
+ISNULL(rmd_movemonth,''),ISNULL(rmd_moveyear,''), --do not want  month year to be spaces
+--rmd_movemonth, rmd_moveyear,
+rmd_cid, rmd_processed, 
+	CASE
+	WHEN m.cl_id is null then c.cl_id else m.cl_id
+	END
+,
+rmd_Postcard, rmd_user, LTR, rmd_created
+from PostProcess.dbo.MailReturnData m WITH (NOLOCK)
+join Control.dbo.Client c WITH (NOLOCK)
+on  (c.cl_cid = m.rmd_cid)
+
+SET @RowCnts = @@ROWCOUNT
+
+IF @CNT <> @RowCnts --@@ROWCOUNT
+BEGIN
+	SET @RowCnts1 = @RowCnts
+	SET @Status = 'Expected counts: ' + @cnt1  +  CHAR(13)+CHAR(10) + 'Actual counts: ' + @RowCnts1  + CHAR(13)+CHAR(10)  + 'For Date:' + convert(char(8),getdate(),1) + CHAR(13)+CHAR(10) + CHAR(13)+CHAR(10) + 'Stored procedure: psp_InsertReturnMailData_From_MailReturnData'  + CHAR(13)+CHAR(10) + CHAR(13)+CHAR(10) 
+GOTO Processing_Error
+END
+
+IF @@Error <> 0
+BEGIN
+   set @Status = 'Insert records FROM MailReturnData into ReturnMailData failed.'
+   GOTO Processing_Error
+END
+
+/*
+***********************************************************************************
+***** Update_ARMS_Seqno_ReturnMailData
+***********************************************************************************
+*/
+Print 'Update Arms Seqno'
+	UPDATE PostProcess.dbo.ReturnMailData
+	 SET RMD_SeqNo = RMD_ID
+	WHERE	RMD_SeqNO IS NULL
+
+/*
+***********************************************************************************
+***** New_CIDS_For_Arms
+***********************************************************************************
+*/
+Print 'New CIDS for ARMS'
+
+Create Table #TempCID
+(CID varchar(3))
+
+Create Table #TempArchiveCid
+(TAC_CID varchar(3))
+
+Insert Into #Tempcid
+Select Distinct RMD_CID 
+From MailReturnData m With (NoLock) 
+join [pippin\prod].control.dbo.client c on c.cl_cid = m.rmd_cid
+where len(rmd_cid) = 3 
+and isnumeric(rmd_cid) = 0 and
+isnumeric(substring(rmd_cid,1,1)) = 0 
+and isnumeric(substring(rmd_cid,2,1)) = 0
+and isnumeric(substring(rmd_cid,3,1)) = 0
+and substring(rmd_cid,1,1) <> ';'
+and substring(rmd_cid,2,1) <> ';'
+and substring(rmd_cid,1,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+and substring(rmd_cid,2,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+and substring(rmd_cid,3,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+Order By RMD_CID
+
+Insert Into #TempArchiveCID
+Select Distinct RMD_CID 
+From ReturnMailDataArchive r With (NoLock) 
+join [pippin\prod].control.dbo.client c on c.cl_cid = r.rmd_cid
+where len(rmd_cid) = 3 
+and isnumeric(rmd_cid) = 0 and
+isnumeric(substring(rmd_cid,1,1)) = 0 
+and isnumeric(substring(rmd_cid,2,1)) = 0
+and isnumeric(substring(rmd_cid,3,1)) = 0
+and substring(rmd_cid,1,1) <> ';'
+and substring(rmd_cid,2,1) <> ';'
+and substring(rmd_cid,1,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+and substring(rmd_cid,2,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+and substring(rmd_cid,3,1)not in (';',',','.','?','/','!','~','#','@','$','%','^','&','*','(',')','-','_','+','=')
+Order By RMD_CID
+
+Delete  b
+From #Tempcid b
+Join #TEMPArchiveCID a on a.tac_cid = b.cid
+Where a.tac_cid = b.cid
+
+SET @CNT = 0
+SET @Cnt = (Select count(cid) from #tempcid)
+
+IF @Cnt > 0
+BEGIN
+	SET @SqlStatement = 'select CID from #tempcid order by cid'
+	--print @SqlStatement
+
+	SET @Subjectx = ''
+	--IF @@SERVERNAME = 'ARAGORN\TEST'
+		--SET @Subjectx = '** TEST ONLY ** ' + @Subjectx
+
+	SET @Messagex = 'New CIDS using the ARMS System.'  + CHAR(13)+CHAR(10) + CHAR(13)+CHAR(10) 
+
+	SET @Subjectx = @Subjectx + ' ' + 'New CIDS using the ARMS System' 
+	SET @ExecString = @SQLStatement
+	EXEC @EmailStat = MSDB.dbo.psp_HTMLEmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+END
+
+/*
+***********************************************************************************
+***** Truncate Table
+***********************************************************************************
+*/
+Truncate Table dbo.MailReturnData
+
+IF @@Error <> 0
+BEGIN
+   set @Status = 'Truncation failed.'
+   GOTO Processing_Error
+END
+
+RETURN
+
+Processing_Error:
+	DROP TABLE #WORK
+	SET @Subjectx = CASE WHEN @@SERVERNAME <> 'PIPPIN\PROD' THEN 'TEST ---' ELSE '' END + 'MailReturnData/ReturnMailData Counts.'
+	--SET @Subjectx = CASE WHEN @@SERVERNAME = 'ARAGORN\TEST' THEN 'TEST ---' ELSE '' END + 'MailReturnData/ReturnMailData Counts.'
+	SET @Messagex = @Status 
+
+	EXEC @EmailStat = MSDB.dbo.psp_HTMLEmailSendWithQuery @Recipientsx, @Subjectx, @Messagex, @PgmName, @ExecString, @AttachResults
+	
+	Return
+
+
+--*************************************************************************************************************************************
+--*************************************************************************************************************************************
+
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_ARS_InsertLast7Days_TEMPACS]    Script Date: 04/30/2012 09:09:19 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+/******************************************************************
+** Stored Procedure: PostProcess.dbo.psp_InsertLast7Days_TEMPACS
+**
+** Description: Creates temp_acs temporary tables from
+** 	  	data in Archive.dbo.PacMasterPool for use in
+**		matching data records in ACS system and sending
+**		complete data back to clients in upload files.
+**
+**              C) Inserts records from PACMASTERPOOl 7 days old or newer
+**
+** 07/13/07 BAR  Split code into three stored procedures
+** 07/16/07 BAR  Tested and made LIVE
+**
+******************************************************************/
+ALTER PROCEDURE [dbo].[psp_ARS_InsertLast7Days_TEMPACS]
+AS
+
+/** Declare email error variables **/
+DECLARE @BusFunctName varchar(20)
+DECLARE @Subj varchar(100)
+DECLARE @Msg varchar(950)
+
+/** Declare log error variables **/
+DECLARE @CallingProc varchar(120)
+DECLARE @CalledProc varchar(120)
+DECLARE @FromTable varchar(100)
+DECLARE @ToTable varchar(100)
+DECLARE @EventID int
+
+/** Declare error checking variables **/
+DECLARE @EmailStat int
+DECLARE @CountTest int
+DECLARE @ErrCode int
+DECLARE @Counter int
+
+/** Declare local variables **/
+DECLARE @Days int
+DECLARE @Cnt int
+DECLARE @DeleteDate91 smalldatetime
+DECLARE @DeleteDate2 smalldatetime
+SET @DeleteDate91 = DATEADD(dd,-91,GETDATE())
+SET @DeleteDate2 = DATEADD(dd,-@Days,GETDATE())
+
+--PRINT @DeleteDate91
+--PRINT @DeleteDate2
+
+/** Set variables for email error messaging **/
+SELECT 	@BusFunctName = 'ARS-Support',
+				@CallingProc = 'psp_CreateALLTempTable'
+
+/** Insert records into temp_acs table **/
+--BEGIN TRAN C
+SET @Days = 7
+SET @Cnt = @Days
+--SET @Cnt = 1
+DECLARE @InsertDate1 smalldatetime
+
+WHILE @Cnt > 0
+--WHILE @Cnt <= @Days
+BEGIN
+
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'Start TRAN C - Insert records today-' + STR(@Cnt) + ' into temp_acs'
+
+SET @InsertDate1 = Control.dbo.pudf_DATEONLY(DATEADD(dd,-@Cnt,GETDATE()))
+
+--PRINT '@Cnt: ' + STR(@Cnt)
+--PRINT '@InsertDate1: ' + CAST(@InsertDate1 AS VARCHAR)
+--PRINT '@COUNTER: ' + STR(@COUNTER)
+
+/** Count records to be inserted in temp_acs table **/
+SET @CountTest = (SELECT count(cid)
+			FROM [GANDALF\MOAD].Archive.dbo.PacMasterPool PMP
+			JOIN Control.dbo.Client C with(nolock)ON C.cl_cid = PMP.cid
+				WHERE sdt = @InsertDate1 and
+					C.cl_activeclient = 'Y' and	
+					(C.cl_acs = 'S' or C.cl_arms = 'Y'))
+
+INSERT PostProcess.dbo.temp_acs
+SELECT cid,ltr,svc,prt,psf,cus,type,rid,sc,tfg,
+			 dna,dn2,da1,na1,da2,na2,dct,dst,dzp,
+			 nct,nst,nzp,dlr as drctory,ph1,acc,mas,zbr,tag,sdt,
+			 bat,dcd,ncd,mtp,mdt,nix,z4n,audamt,
+			 substring(substring(Control.dbo.pudf_alltrim(acs),1,
+				len(Control.dbo.pudf_alltrim(acs))-2),
+				5,len(Control.dbo.pudf_alltrim(acs))) as acs,
+			 cmno,c39,pos,bad,printertype,postagetype,sys,
+			 v01,v02,v03,v04,v05,v06,v07,v08,v09,v10,v11,v12,
+			 v13,v14,v15,v29	
+FROM [GANDALF\MOAD].Archive.dbo.PacMasterPool PMP 
+JOIN
+Control.dbo.Client C with(nolock)
+ON C.cl_cid = PMP.cid
+WHERE sdt = @InsertDate1 and
+			  C.cl_activeclient = 'Y' and	
+			 (C.cl_acs = 'S' or C.cl_arms = 'Y')
+
+
+SELECT @Counter = @@ROWCOUNT,
+			 @ErrCode = @@ERROR
+
+-- Test for errors
+IF @ErrCode <> 0
+BEGIN
+	--ROLLBACK TRAN C
+	SELECT	@EventID =1002,
+					@CalledProc = '',
+					@FromTable = '[GANDALF\MOAD].Archive.dbo.PacMasterPool',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+								 	'Error Code: '+STR(@ErrCode)+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID),
+					@Subj = 'Processing error in TRAN C of '+@CallingProc
+ GOTO Processing_Error
+END
+
+IF @Counter <> @CountTest
+BEGIN
+	--ROLLBACK TRAN C
+	SELECT	@EventID = 2002,
+					@CalledProc = '',
+					@FromTable = '[GANDALF\MOAD].Archive.dbo.PacMasterPool',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID)+CHAR(13)+CHAR(10)+
+									'Expected Count: '+STR(@CountTest)+CHAR(13)+CHAR(10)+
+									'Actual Count: '+STR(@Counter),
+					@Subj = 'Count error in TRAN C of '+@CallingProc
+ 	GOTO Count_Error
+END
+
+/** Added code to log start of transaction **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'End TRAN C - Insert records today-' + STR(@Cnt) + ' into temp_acs'
+
+SET @Cnt = @Cnt - 1
+--SET @Cnt = @Cnt + 1
+END
+
+/** Commit transaction if no errors **/
+--COMMIT TRAN C
+
+/** Added code to log RETURN CODE **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT GETDATE(),
+			'psp_InsertLast7Days_TEMPACS RETURN CODE: ' + STR(@@ERROR)
+RETURN
+
+-- Processing Error label code
+Processing_Error:
+BEGIN
+	-- Insert processing error record into ACS error log 
+	INSERT	ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+	-- Sends processing error email
+	EXEC	@EmailStat = Control.dbo.psp_EmailSend 
+				@BusFunctName,
+				@Subj,
+				@Msg,
+				@CallingProc			
+	-- Tests for email error
+	IF	@EmailStat <> 0
+	GOTO Email_Error
+RETURN
+END 
+
+-- Count_Error label code
+Count_Error:
+BEGIN
+	-- Insert count error record into ACS error log
+	INSERT ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+	-- Send count error email
+	EXEC	@EmailStat = Control.dbo.psp_EmailSend 
+				@BusFunctName,
+				@Subj,
+				@Msg,
+				@CallingProc			
+	-- Test for email error
+	IF	@EmailStat <> 0
+	GOTO Email_Error		
+RETURN
+END
+
+-- Email_Error label code
+Email_Error:
+BEGIN
+	-- Inserts record into ACS error log	
+	SELECT	@EventID = 8888,
+					@CalledProc = 'Control.dbo.psp_EmailSend'
+	INSERT ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+RETURN
+END
+
+
+--*************************************************************************************************************************************
+--*************************************************************************************************************************************
+
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_CreateALLTempTable]    Script Date: 04/30/2012 09:10:02 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+/******************************************************************
+** Stored Procedure: PostProcess.dbo.psp_CreateALLTempTable
+**
+** Description: Creates temp_acs temporary tables from
+** 	  	data in Archive.dbo.PacMasterPool for use in
+**		matching data records in ACS system and sending
+**		complete data back to clients in upload files.
+**
+**		A) Delete records in temp_acs 90 days old or older
+**              B) Delete records in temp_acs 7 days old or newer
+**              C) Calls stored procedure on GANDALF\MOAD to 
+**		   insert records from PACMASTERPOOl 7 days old or newer
+**
+** 03/05/07 BAR  Changed code to delete/update 7 days per CG
+** 12/14/06 BAR  Added code for field V29 to be filled
+** 06/26/06 BAR  Made LIVE for TEMP_ACS
+** 06/20/06 BAR  Modified code to clean up/speed up processing
+** 06/19/06 BAR  Testing code to do insert one day at a time
+** 06/01/06 BAR  Added code to log each transaction for Rob
+**               and removed TRANSACTION code
+** 05/25/06 BAR  Made LIVE; chg temp_acs2 to temp_acs
+** 04/27/06 BAR  Testing again before making LIVE; chg temp_acs to temp_acs2
+** 03/10/06 BAR  Made LIVE in sp_CreateACSTempTables
+** 02/06/06 BAR  Changed code to update only last 7 days
+** 01/22/04 BAR  Added more V## fields to table per client request
+** 10/07/03 BAR  Added code to get MOAT data for ARMS clients
+** 06/13/03 BAR  Created procedure to ALTER  table individually
+**
+******************************************************************/
+ALTER    PROCEDURE [dbo].[psp_CreateALLTempTable]
+AS
+
+/** Declare email error variables **/
+DECLARE @BusFunctName varchar(20)
+DECLARE @Subj varchar(100)
+DECLARE @Msg varchar(950)
+
+/** Declare log error variables **/
+DECLARE @CallingProc varchar(120)
+DECLARE @CalledProc varchar(120)
+DECLARE @FromTable varchar(100)
+DECLARE @ToTable varchar(100)
+DECLARE @EventID int
+
+/** Declare error checking variables **/
+DECLARE @EmailStat int
+DECLARE @CountTest int
+DECLARE @ErrCode int
+DECLARE @Counter int
+
+/** Declare local variables **/
+DECLARE @Days int
+DECLARE @Cnt int
+DECLARE @DeleteDate91 smalldatetime
+DECLARE @DeleteDate2 smalldatetime
+SET @Days = 7
+SET @Cnt = 1
+SET @DeleteDate91 = DATEADD(dd,-91,GETDATE())
+SET @DeleteDate2 = DATEADD(dd,-@Days,GETDATE())
+
+--PRINT @DeleteDate91
+--PRINT @DeleteDate2
+
+/** Set variables for email error messaging **/
+SELECT 	@BusFunctName = 'ARS-Support',
+				@CallingProc = 'psp_CreateALLTempTable'
+
+/** Delete records that are 91 days old or older **/
+--BEGIN TRAN A
+/** Added code to log start of transaction **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'Start TRAN A - Delete today-91 from temp_acs'
+
+SET @CountTest = (SELECT count(1)
+			FROM PostProcess.dbo.temp_acs with(nolock)
+			WHERE sdt < @DeleteDate91)
+
+
+DELETE PostProcess.dbo.temp_acs
+WHERE sdt < @DeleteDate91
+
+SELECT @Counter = @@ROWCOUNT,
+			 @ErrCode = @@ERROR
+
+-- Test for errors
+IF @ErrCode <> 0
+BEGIN
+	--ROLLBACK TRAN A
+	SELECT	@EventID =1000,
+					@CalledProc = '',
+					@FromTable = '',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+						'Error Code: '+STR(@ErrCode)+CHAR(13)+CHAR(10)+
+						'Error ID: '+STR(@EventID),
+					@Subj = 'Processing error in TRAN A of '+@CallingProc
+ GOTO Processing_Error
+END
+
+IF @Counter <> @CountTest
+BEGIN
+	--ROLLBACK TRAN A
+	SELECT	@EventID = 2000,
+					@CalledProc = '',
+					@FromTable = '',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+						'Error ID: '+STR(@EventID)+CHAR(13)+CHAR(10)+
+						'Expected Count: '+STR(@CountTest)+CHAR(13)+CHAR(10)+
+						'Actual Count: '+STR(@Counter),
+					@Subj = 'Count error in TRAN A of '+@CallingProc
+ 	GOTO Count_Error
+END
+
+/** Added code to log start of transaction **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'End TRAN A - Delete today-91 from temp_acs'
+
+/** Commit transaction if no errors **/
+--COMMIT TRAN A
+
+/** Delete records that are 7 days old or newer **/
+--BEGIN TRAN B
+/** Added code to log start of transaction **/
+SET @Days = 7
+SET @Cnt = 1
+
+WHILE @Cnt <= @Days
+BEGIN
+
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'Start TRAN B - Delete today-' + STR(@Cnt) + ' from temp_acs'
+
+--SET @DeleteDate2 = DATEADD(dd,-@Cnt,GETDATE())
+SET @DeleteDate2 = Control.dbo.pudf_DATEONLY(DATEADD(dd,-@Cnt,GETDATE()))
+
+--PRINT '@Cnt: ' + STR(@Cnt)
+--PRINT '@DeleteDate2: ' + CAST(@DeleteDate2 AS VARCHAR)
+
+SET @CountTest = (SELECT count(1)
+			FROM PostProcess.dbo.temp_acs with(nolock)
+			WHERE sdt >= @DeleteDate2)
+
+DELETE PostProcess.dbo.temp_acs
+WHERE sdt >= @DeleteDate2
+
+SELECT @Counter = @@ROWCOUNT,
+			 @ErrCode = @@ERROR
+
+-- Test for errors
+IF @ErrCode <> 0
+BEGIN
+	--ROLLBACK TRAN B
+	SELECT	@EventID =1000,
+					@CalledProc = '',
+					@FromTable = '',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+								 	'Error Code: '+STR(@ErrCode)+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID),
+					@Subj = 'Processing error in TRAN B of '+@CallingProc
+ GOTO Processing_Error
+END
+
+IF @Counter <> @CountTest
+BEGIN
+	--ROLLBACK TRAN B
+	SELECT	@EventID = 2000,
+					@CalledProc = '',
+					@FromTable = '',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID)+CHAR(13)+CHAR(10)+
+									'Expected Count: '+STR(@CountTest)+CHAR(13)+CHAR(10)+
+									'Actual Count: '+STR(@Counter),
+					@Subj = 'Count error in TRAN B of '+@CallingProc
+ 	GOTO Count_Error
+END
+
+/** Added code to log start of transaction **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'End TRAN B - Delete today-' + STR(@Cnt) + ' from temp_acs'
+
+/** Commit transaction if no errors **/
+--COMMIT TRAN B
+
+SET @Cnt = @Cnt + 1
+
+END
+
+/** Insert records into temp_acs table **/
+--BEGIN TRAN C
+SET @Days = 7
+SET @Cnt = 1
+DECLARE @InsertDate1 smalldatetime
+
+WHILE @Cnt <= @Days
+BEGIN
+
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'Start TRAN C - Insert records today-' + STR(@Cnt) + ' into temp_acs'
+
+SET @InsertDate1 = Control.dbo.pudf_DATEONLY(DATEADD(dd,-@Cnt,GETDATE()))
+
+--PRINT '@Cnt: ' + STR(@Cnt)
+--PRINT '@InsertDate1: ' + CAST(@InsertDate1 AS VARCHAR)
+--PRINT '@COUNTER: ' + STR(@COUNTER)
+
+/** Count records to be inserted in temp_acs table **/
+SET @CountTest = (SELECT count(cid)
+			FROM [GANDALF\MOAD].Archive.dbo.PacMasterPool PMP
+			JOIN Control.dbo.Client C with(nolock)ON C.cl_cid = PMP.cid
+				WHERE sdt = @InsertDate1 and
+					C.cl_activeclient = 'Y' and	
+					(C.cl_acs = 'S' or C.cl_arms = 'Y'))
+
+INSERT PostProcess.dbo.temp_acs
+SELECT cid,ltr,svc,prt,psf,cus,type,rid,sc,tfg,
+			 dna,dn2,da1,na1,da2,na2,dct,dst,dzp,
+			 nct,nst,nzp,dlr as drctory,ph1,acc,mas,zbr,tag,sdt,
+			 bat,dcd,ncd,mtp,mdt,nix,z4n,audamt,
+			 substring(substring(master.dbo.pudf_alltrim(acs),1,
+				len(master.dbo.pudf_alltrim(acs))-2),
+				5,len(master.dbo.pudf_alltrim(acs))) as acs,
+			 cmno,c39,pos,bad,printertype,postagetype,sys,
+			 v01,v02,v03,v04,v05,v06,v07,v08,v09,v10,v11,v12,
+			 v13,v14,v15,v29	
+FROM [GANDALF\MOAD].Archive.dbo.PacMasterPool PMP 
+JOIN
+Control.dbo.Client C with(nolock)
+ON C.cl_cid = PMP.cid
+WHERE sdt = @InsertDate1 and
+			  C.cl_activeclient = 'Y' and	
+			 (C.cl_acs = 'S' or C.cl_arms = 'Y')
+
+
+SELECT @Counter = @@ROWCOUNT,
+			 @ErrCode = @@ERROR
+
+-- Test for errors
+IF @ErrCode <> 0
+BEGIN
+	--ROLLBACK TRAN C
+	SELECT	@EventID =1002,
+					@CalledProc = '',
+					@FromTable = '[GANDALF\MOAD].Archive.dbo.PacMasterPool',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+								 	'Error Code: '+STR(@ErrCode)+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID),
+					@Subj = 'Processing error in TRAN C of '+@CallingProc
+ GOTO Processing_Error
+END
+
+IF @Counter <> @CountTest
+BEGIN
+	--ROLLBACK TRAN C
+	SELECT	@EventID = 2002,
+					@CalledProc = '',
+					@FromTable = '[GANDALF\MOAD].Archive.dbo.PacMasterPool',
+					@ToTable = 'PostProcess.dbo.temp_acs',
+					@Msg =	'Stored Procedure: '+@CallingProc+CHAR(13)+CHAR(10)+
+									'Error ID: '+STR(@EventID)+CHAR(13)+CHAR(10)+
+									'Expected Count: '+STR(@CountTest)+CHAR(13)+CHAR(10)+
+									'Actual Count: '+STR(@Counter),
+					@Subj = 'Count error in TRAN C of '+@CallingProc
+ 	GOTO Count_Error
+END
+
+/** Added code to log start of transaction **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT	GETDATE(),
+				'End TRAN C - Insert records today-' + STR(@Cnt) + ' into temp_acs'
+
+SET @Cnt = @Cnt + 1
+END
+
+/** Commit transaction if no errors **/
+--COMMIT TRAN C
+
+/** Added code to log RETURN CODE **/
+INSERT ProdLog.dbo.TEMPACSLog
+SELECT GETDATE(),
+			'RETURN CODE: ' + STR(@@ERROR)
+RETURN
+
+-- Processing Error label code
+Processing_Error:
+BEGIN
+	-- Insert processing error record into ACS error log 
+	INSERT	ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+	-- Sends processing error email
+	EXEC	@EmailStat = Control.dbo.psp_EmailSend 
+				@BusFunctName,
+				@Subj,
+				@Msg,
+				@CallingProc			
+	-- Tests for email error
+	IF	@EmailStat <> 0
+	GOTO Email_Error
+RETURN
+END 
+
+-- Count_Error label code
+Count_Error:
+BEGIN
+	-- Insert count error record into ACS error log
+	INSERT ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+	-- Send count error email
+	EXEC	@EmailStat = Control.dbo.psp_EmailSend 
+				@BusFunctName,
+				@Subj,
+				@Msg,
+				@CallingProc			
+	-- Test for email error
+	IF	@EmailStat <> 0
+	GOTO Email_Error		
+RETURN
+END
+
+-- Email_Error label code
+Email_Error:
+BEGIN
+	-- Inserts record into ACS error log	
+	SELECT	@EventID = 8888,
+					@CalledProc = 'Control.dbo.psp_EmailSend'
+	INSERT ProdLog.dbo.ACSErrorLog
+	SELECT	GETDATE(),
+					@CallingProc,
+					@CalledProc,
+					@FromTable,
+					@ToTable,
+					@EventID
+RETURN
+END
+
+
+--*************************************************************************************************************************************
+--*************************************************************************************************************************************
+
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_GetAcctNoForARMS_MailReturnData]    Script Date: 04/30/2012 09:10:46 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+
+/*****************************************************************
+** Stored Procedure: PostProcess.dbo.psp_GetAcctNoForARMS_MailReturnData
+** 10/26/04 BAR removed setting the rmd_queued field to "Y" from the stored procedure
+**              this will now be taken care of in the program
+** 10/08/04 BAR added update to add #'s before and after the data in rmd_keyline
+**              modified design to increase this field to 18 characters
+** 10/06/04 BAR PER TASK #460 take from using temp_acs table to using
+**                            [GANDLAF\MOAD].Archive.dbo.PACMASTERPOOL
+**                            Pacmasterpool acs is combined with cid and acscode
+**                            so using the rmd_keyline from mailreturndata instead of rmd_acscode 
+** 08/02/04 BAR  Beau stated that he feels this line was for when we 
+--           data was being taken from ReturnMailData now that
+--	     we are taking from MailReturnData everything needs to go across 
+ --AND R.RMD_Queued = 'N'
+** 06/22/04 BAR  added substring to rmd_acscode so that it would match correctly to temp_acs
+** 06/21/04 BAR  added temp_acs ltr to MailReturnData, MailReturnData2 and ReturnMailData
+** 12/19/03 BAR  modified to read from the temp table
+**		 MailReturnData
+**
+*****************************************************************/
+ALTER                       PROCEDURE [dbo].[psp_GetAcctNoForARMS_MailReturnData]
+@Detail2 varchar(1000) OUTPUT
+AS
+
+DECLARE @C_Name varchar(50)
+DECLARE @CL_ID int
+DECLARE @ErrorCode int
+DECLARE @SubmitReport varchar(1000)
+DECLARE @Detail varchar(1000)
+
+SET @C_Name = '501'
+SET @CL_ID = '0'
+SET @ErrorCode = '0'
+
+/**Update RMD_AcctNo and RMD_DNA for PAC1 clients 
+with new ACSCode field which is the following CID+RID(6 digits)+YMMDD **/
+
+ UPDATE MailReturnData
+ SET RMD_Keyline = '#' + RMD_KeyLine + '#'
+
+UPDATE M
+SET RMD_AcctNo = T.ACC,
+RMD_DNA = T.DNA,
+LTR = T.LTR
+FROM dbo.MailReturnData M,
+	[GANDALF\MOAD].Archive.dbo.PACMASTERPOOL T
+WHERE M.RMD_KEYLINE  = T.ACS 
+
+/*--UPDATE dbo.ReturnMailData
+UPDATE M
+SET RMD_AcctNo = T.ACC,
+RMD_DNA = T.DNA,
+LTR = T.LTR
+FROM dbo.MailReturnData M,
+	dbo.TEMP_ACS T
+WHERE substring(M.rmd_acscode,1,len(M.rmd_acscode)-1) = T.ACS
+ AND M.RMD_CID = T.CID 
+--8/2/04 BAR Beau stated that he feels this line was for when we 
+--           data was being taken from ReturnMailData now that
+--	     we are taking from MailReturnData everything needs to go across 
+ --AND R.RMD_Queued = 'N' */
+
+BEGIN
+If @@ERROR <> 0
+SET @Detail2 = 'Update failed when retrieving Debtor ID and Debtor Name. Please call Technical support.'
+END
+
+/**Update CL_ID with ID from Client Table**/
+--UPDATE dbo.ReturnMailData
+UPDATE M
+SET CL_ID = CL.CL_ID
+--FROM dbo.ReturnMailData R,
+FROM dbo.MailReturnData M,
+	Control.dbo.Client CL
+WHERE M.RMD_CID = CL.CL_CID AND
+M.RMD_Queued = 'N'
+
+If @@ERROR <> 0
+BEGIN
+SET @Detail2 = 'Update failed when retrieving Client ID for ReturnMailData table. Please call Technical support.'
+END
+
+-- 10/26/04 BAR  RMD_Queued will be taken care of in the program by placing a "Y"
+/**If the the variable @SubmitReport does not return an error then change the RMD_Queued to 'Y'**/
+/*IF @Detail2 = NULL
+--UPDATE PostProcess.dbo.ReturnMailData
+UPDATE M
+SET RMD_Queued = 'Y'
+--FROM PostProcess.dbo.ReturnMailData,
+FROM PostProcess.dbo.MailReturnData M,
+	Control.dbo.Client CL
+WHERE --RMD_Type = 'M' AND
+--    M.RMD_CID = CL.CL_CID AND
+	M.CL_ID = CL.CL_ID AND
+--	ReturnMailData.CL_ID > 0 AND
+--	M.CL_ID > 0 AND
+	CL.CL_ARMS = 'Y' AND
+	CL.CL_ActiveClient = 'Y' AND
+	RMD_Queued = 'N'
+
+/*
+--UPDATE PostProcess.dbo.ReturnMailData
+UPDATE M
+SET RMD_Queued = 'Y'
+--FROM PostProcess.dbo.ReturnMailData,
+FROM PostProcess.dbo.MailReturnData M,
+	Control.dbo.Client CL
+WHERE RMD_Type = 'K' AND
+    M.RMD_CID = CL.CL_CID AND
+--	ReturnMailData.CL_ID > 0 AND
+	M.CL_ID > 0 AND
+	CL.CL_ARMS = 'Y' AND
+	CL.CL_ActiveClient = 'Y' AND
+	RMD_Queued = 'N'
+
+--UPDATE PostProcess.dbo.ReturnMailData
+UPDATE M
+SET RMD_Queued = 'Y'
+--FROM PostProcess.dbo.ReturnMailData,
+FROM PostProcess.dbo.MailReturnData M,
+	Control.dbo.Client CL
+WHERE RMD_Type = 'U' AND
+    M.RMD_CID = CL.CL_CID AND
+--	ReturnMailData.CL_ID > 0 AND
+	M.CL_ID > 0 AND
+	CL.CL_ARMS = 'Y' AND
+	CL.CL_ActiveClient = 'Y' AND
+	RMD_Queued = 'N'
+
+*/
+*/
+
+
+--*************************************************************************************************************************************
+--*************************************************************************************************************************************
+
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_PBCLoadPLANETData]    Script Date: 04/30/2012 09:11:27 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+/******************************************************
+
+Loads USPS Planet file
+
+1) BULK INSERT USPS file into PLANETStaging table
+
+2) Delete records from PlanetStaging table where 
+   PLANET code code is already in PLANET and PLANETArchive
+
+3) INSERT all records from PLANETStaging to PLANETArchive 
+
+4) INSERT all records from PLANETStaging to PLANET
+
+5) Update PLANET fields
+	ACC    = PACMASTERPOOL.ACC
+	MAS    = PACMASTERPOOL.MAS
+	DNA    = PACMASTERPOOL.DNA
+	SDT    = PACMASTERPOOL.SDT
+	Ltr    = PACMASTERPOOL.Ltr
+	AudAmt = PACMASTERPOOL.AudAmt
+	CL_ID  = CLIENT.CL_ID
+6) Delete PLANET where ACC is null 
+
+-- 08/04/06 CLG - Add WITH (NOLOCK) hint
+-- 09/21/06 DL  - Added Step 6 "Delete records in PLANET table that did 
+		  not get updated in step 5"
+
+*******************************************************/
+
+
+ALTER                     PROCEDURE [dbo].[psp_PBCLoadPLANETData]
+	@FileName as VarChar(1000)
+AS
+
+
+-- DECLARE @FileName VARCHAR(1000)
+-- DECLARE @Records INT
+-- SET @FileName = 'V:\usps\TEST123'
+-- SET @Records = 64169
+
+
+DECLARE @ErrMsg VarChar(2000)
+
+
+
+BEGIN  TRAN A
+
+
+/******************************************************
+1) BULK INSERT PLANETStaging
+*******************************************************/
+TRUNCATE TABLE PLANETStaging
+DECLARE @ExecString varchar(1000)
+SET @ExecString = 'BULK INSERT PLANETStaging FROM ''' + RTRIM(@FileName) + ''' WITH (FIELDTERMINATOR = '','', MAXERRORS = 0, TABLOCK)'
+EXECUTE (@ExecString)											 
+IF @@ERROR <> 0 
+BEGIN
+	SET @ErrMsg = ''
+	SET @ErrMsg = @ErrMsg + 'FAILED TO BULK INSERT PLANETStaging FROM ''' + RTRIM(@FileName)  + CHAR(13)
+	ROLLBACK TRAN A
+	RAISERROR(@ErrMsg, 16, 1)
+	RETURN
+END
+
+
+/******************************************************************
+2) Delete PlanetStaging rows where the PLANET code is already in PLANET and PLANETArchive
+******************************************************************/
+
+DELETE PLANETStaging
+WHERE PLANET IN (SELECT PLANET FROM PLANET)
+OR    PLANET IN (SELECT PLANET FROM PLANETArchive)
+
+IF @@ERROR <> 0 
+BEGIN
+	SET @ErrMsg = ''
+	SET @ErrMsg = @ErrMsg + 'FAILED TO Delete PlanetStaging rows where the PLANET code is already in PLANET and PLANETArchive'  + CHAR(13)
+	ROLLBACK TRAN A
+	RAISERROR(@ErrMsg, 16, 1)
+	RETURN
+END
+
+
+/*******************************************************
+3) INSERT INTO PLANETArchive
+********************************************************/
+INSERT INTO PLANETArchive
+(	[ReceivedDate], [FacilityID], [OperationCode], [ScanDate], [POSTNET], [PLANET])
+SELECT 	GETDATE(),	[FacilityID], [OperationCode], [ScanDate], [POSTNET], [PLANET]
+FROM PLANETStaging With (NOLOCK)
+
+IF @@ERROR <> 0 
+BEGIN
+	SET @ErrMsg = ''
+	SET @ErrMsg = @ErrMsg + 'FAILED TO INSERT INTO PLANETArchive'  + CHAR(13)
+	ROLLBACK TRAN A
+	RAISERROR(@ErrMsg, 16, 1)
+	RETURN
+END
+
+
+/******************************************************************
+4) Insert rows from PLANETStaging to PLANET
+******************************************************************/
+
+-- Delete from staging where its not the first scan
+
+-- Get the earliest scan record
+SELECT PLANET, MIN(ScanDate) as ScanDate
+INTO #WORK
+FROM PLANETStaging WITH (NOLOCK)
+GROUP BY PLANET
+
+-- Delete all other scan record
+DELETE P
+FROM PLANETStaging P
+JOIN #WORK W WITH (NOLOCK)
+ON (P.PLANET = W.PLANET) AND
+   (P.Scandate <> W.ScanDate)
+Drop table #WORK
+
+
+INSERT INTO PLANET
+(	[FacilityID], [OperationCode], [ScanDate], [POSTNET], [PLANET])
+SELECT 	[FacilityID], [OperationCode], [ScanDate], [POSTNET], [PLANET] 
+FROM PLANETStaging With (NOLOCK)
+
+IF @@ERROR <> 0 
+BEGIN
+	ROLLBACK TRAN A
+	RETURN
+END
+
+/****************************************
+5) Update PLANET fields 
+****************************************/
+
+-- Postoffice returns us a 13 character planet code which is missing the check digit.
+-- We add the check to it so we can match it with the planet code in postmasterpool
+-- table which has 14 characters
+UPDATE Planet
+SET Planet = dbo.pudf_AddCheckDigit(Planet)
+WHERE LEN(dbo.pudf_AllTrim(Planet)) = 13
+
+
+UPDATE P
+SET 	ACC = M.ACC,
+	MAS = M.MAS,
+	DNA = M.DNA,
+	SDT = M.SDT,
+	Ltr = M.Ltr,
+	AudAmt = CAST(M.AudAmt as MONEY),
+	CL_ID = CLIENT.CL_ID
+FROM PLANET P  
+JOIN [GANDALF\MOAD].Archive.dbo.PACMASTERPOOL M
+ON (P.PLANET = M.ConfirmO AND P.CL_ID IS Null)
+JOIN Control.dbo.Client CLIENT WITH (NOLOCK)
+ON (M.CID = CLIENT.CL_CID)
+
+IF @@ERROR <> 0 
+BEGIN
+	ROLLBACK TRAN A
+	RETURN
+END
+
+/****************************************
+6) Delete records in PLANET table 
+****************************************/
+DELETE PLANET
+WHERE   ACC is null
+AND 	MAS is null
+AND 	DNA is null
+AND 	SDT is null
+AND	Ltr is null
+
+IF @@ERROR <> 0 
+BEGIN
+	ROLLBACK TRAN A
+	RETURN
+END
+
+COMMIT TRAN A
+
+
+--*************************************************************************************************************************************
+--*************************************************************************************************************************************
+
+USE [PostProcess]
+GO
+/****** Object:  StoredProcedure [dbo].[psp_TemporarySpecialPSIFix]    Script Date: 04/30/2012 09:12:10 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+
+
+/*
+This is a fix for ARMS.  Return mail were shredded before they were scanned.
+05/15/09 BAR 4/01
+05/14/09 BAR 3/31
+05/13/09 BAR 3/30
+05/12/09 BAR 3/27 
+05/11/09 BAR 3/26
+05/08/09 BAR march 25th
+05/06/09 BAR March 24th
+05/05/09 BAR March 23rd
+05/04/09 BAR March 20th
+05/01/09 BAR March 19th
+04/30/09 BAR March 18th
+04/29/09 BAR March 17th
+04/28/09 BAR March 16th
+04/27/09 BAR March 15th
+04/24/09 BAR March 14th
+04/23/09 DL  Inserted data for March 13th.
+*/
+
+ALTER procedure [dbo].[psp_TemporarySpecialPSIFix]
+
+as 
+
+---=== Select the special PSI record that were possibly shredded berfore
+--     they were scanned.  March 13 - April 1 
+--11/07/11 BAR i believe this is used as necessary
+--             replace year you need into 'WorkYear'  example pmp.archive2011.dbo.pacmasterpool
+--			   you also need to modify the SDT = date
+select distinct 
+	0 as cl_id,
+	cid,
+	prt,
+	ltr, 
+	acc, 
+	acs,
+	pc_id
+into #temp1 
+--from [GANDALF\MOAD].PMPArchive'WorkYear'.dbo.PacMasterPool
+--note out/delete the next line when PMPARchive is available
+from [Gandalf\moad].archive.dbo.Pacmasterpool 
+where sdt = '04/01/09'
+and prt > ''
+and Type in ('JL','TRHD')
+and special = 'a'
+and isnull(lts_id,'') <> '80'
+
+--select distinct 
+--	0 as cl_id,
+--	cid,
+--	prt,
+--	ltr, 
+--	acc, 
+--	acs,
+--	pc_id
+--into #temp1 
+--from [Gandalf\moad].archive.dbo.Pacmasterpool (nolock)
+--where sdt = '04/01/09'
+--and prt > ''
+--and Type in ('JL','TRHD')
+--and special = 'a'
+--and isnull(lts_id,'') <> '80'
+
+
+---=== delete records that uses the 10-70 flat envelope.
+--	   Flat envelope does not go to PSI as speical mailing.
+--     We can only determine if at letter uses 10-70 by the
+--     prtgrp.  Below are is the list of prt searched from 
+--     the pac3 system.
+delete #temp1
+where prt in('ZAV5','QAV5','JAV5','ZAV6','QAV6'
+			,'JAV6','JAV7','QAV7','ZAV7','ZAV8'
+			,'QAV8','JAV8','JAV9','QAV9','ZAV9'
+			,'ZA10','QA10','JA10','JA11','QA11'
+			,'ZA11','ZA12','QA12','JA12','JA13'
+			,'QA13','ZA13','MJHF','QPP7','ZPP7'
+			,'JPP7')
+
+---=== update the cl_id
+update t
+	set t.cl_id = c.cl_id
+from #temp1 t
+join [pippin\prod].control.dbo.client c
+on (c.cl_cid = t.cid)
+
+---=== Prep the records for inserting
+SELECT DISTINCT
+		'2' as rmd_rectype,
+	   'ARMSSYS' as rmd_parTcode, 
+		REPLACE(acs,'#','') as rmd_keyline,
+		'U' as rmd_type,  -- move-no-forward
+		SUBSTRING(REPLACE(acs,'#',''),4,13) as rmd_acscode,
+		'Y' as rmd_queued, 
+		getdate() as rmd_date,
+		ISNULL(ACC, '') as rmd_acctno, 
+		'' as rmd_dna,
+		'' as rmd_streetaddr, 
+		'' as rmd_streetaddr2,
+		'' as rmd_city,
+		'' as rmd_state,
+		'' as rmd_zip,
+		'' as rmd_5digitzip,
+		'' as rmd_hyphen,
+		'' as rmd_zip4,
+		'' as RMD_DPBCInfo,
+		'' as RMD_LblFormatNewAddr,
+ 		cid as rmd_cid,
+		CL_ID, 
+		'0' as rmd_postcard,   
+		HOST_NAME() as rmd_user, 
+		Ltr,
+		'SPECIAL PSI' as Batch,
+		'0' as 	ImageNumber
+into #Temp2
+FROM #Temp1
+
+
+---=== delete records if it already exists in ReturnMaildata table
+delete #temp2 where rmd_keyline in (select rmd_keyline from ReturnMailDataArchive(nolock))
+delete #temp2 where rmd_keyline in (select rmd_keyline from ReturnMailData(nolock))
+delete #temp2 where rmd_keyline in (select REPLACE(ard_ARMSBarcode,'#','') from ARMS2ReviewData (nolock))
+
+--select top 1 * from ReturnMailData
+--select top 2 * from #temp2
+
+
+
+-- Insert move-no-forward records into ReturnMailData
+PRINT 'Insert into ReturnMailData '
+INSERT ReturnMailData
+( 	   rmd_rectype,rmd_partcode,rmd_keyline,rmd_type,rmd_acscode,rmd_queued,rmd_date,rmd_acctno,rmd_dna,rmd_streetaddr,rmd_streetaddr2,rmd_city,rmd_state,rmd_zip,rmd_5digitzip,rmd_hyphen,rmd_zip4,RMD_DPBCInfo,RMD_LblFormatNewAddr,rmd_cid,cl_ID,rmd_postcard,rmd_user,ltr,batch,imageNumber)
+Select rmd_rectype,rmd_partcode,rmd_keyline,rmd_type,rmd_acscode,rmd_queued,rmd_date,rmd_acctno,rmd_dna,rmd_streetaddr,rmd_streetaddr2,rmd_city,rmd_state,rmd_zip,rmd_5digitzip,rmd_hyphen,rmd_zip4,RMD_DPBCInfo,RMD_LblFormatNewAddr,rmd_cid,cl_ID,rmd_postcard,rmd_user,ltr,batch,imageNumber
+from #temp2
+
+
+---=== Clean up
+drop table #temp1
+drop table #temp2
+
+
+return
